@@ -43,6 +43,7 @@ C:/Users/kangw/ramp-bot/
   report_company.py     # Claude Opus + 10-part company framework + web search tool
   report_macro.py       # Claude Opus + 11-part macro framework + web search tool
   tg_group.py           # Sends report text + docx + PDF to Telegram groups via Telethon
+  requirements.txt      # Python dependencies (used by GitHub Actions pip cache)
   .github/workflows/ramp.yml  # GitHub Actions workflow
   .env                  # Credentials (local only, gitignored)
   .gitignore            # Excludes .env, state.json, staged_files/, reports/, SSH/
