@@ -20,9 +20,7 @@ jobs:
           cache: "pip"
 
       - name: Install Python dependencies
-        run: |
-          pip install anthropic yfinance pandas pdfplumber python-docx \
-            duckduckgo-search requests beautifulsoup4 telethon python-dotenv
+        run: pip install -r requirements.txt
 
       - name: Install LibreOffice
         run: sudo apt-get install -y libreoffice

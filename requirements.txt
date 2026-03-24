@@ -1,0 +1,10 @@
+anthropic
+yfinance
+pandas
+pdfplumber
+python-docx
+duckduckgo-search
+requests
+beautifulsoup4
+telethon
+python-dotenv
