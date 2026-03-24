@@ -3,7 +3,7 @@ yfinance
 pandas
 pdfplumber
 python-docx
-duckduckgo-search
+ddgs
 requests
 beautifulsoup4
 telethon
