@@ -1,0 +1,8 @@
+.env
+state.json
+staged_files/
+reports/
+__pycache__/
+*.pyc
+*.pyo
+SSH/

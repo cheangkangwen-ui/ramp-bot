@@ -1,0 +1,38 @@
+name: Ramp Report
+
+on:
+  repository_dispatch:
+    types: [ramp]
+
+jobs:
+  ramp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          pip install anthropic yfinance pandas pdfplumber python-docx \
+            duckduckgo-search requests beautifulsoup4 telethon python-dotenv
+
+      - name: Install LibreOffice
+        run: sudo apt-get install -y libreoffice
+
+      - name: Run ramp
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
+          ASSET:         ${{ github.event.client_payload.asset }}
+          CHAT_ID:       ${{ github.event.client_payload.chat_id }}
+          STAGED_FILES:  ${{ toJson(github.event.client_payload.staged_files) }}
+        run: python bot_runner.py
