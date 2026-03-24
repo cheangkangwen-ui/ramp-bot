@@ -114,9 +114,10 @@ export default {
 
     const chat_id = String(message.chat.id);
 
-    // Auth check
-    if (env.ALLOWED_CHAT_ID && chat_id !== String(env.ALLOWED_CHAT_ID)) {
-      return new Response("ok");
+    // Auth check — supports comma-separated IDs (e.g. "233058647,501547132")
+    if (env.ALLOWED_CHAT_ID) {
+      const allowed = String(env.ALLOWED_CHAT_ID).split(",").map(s => s.trim());
+      if (!allowed.includes(chat_id)) return new Response("ok");
     }
 
     const text = message.text || message.caption || "";
@@ -244,9 +245,7 @@ jobs:
           cache: "pip"
 
       - name: Install Python dependencies
-        run: |
-          pip install anthropic yfinance pandas pdfplumber python-docx \
-            duckduckgo-search requests beautifulsoup4 telethon python-dotenv
+        run: pip install -r requirements.txt
 
       - name: Install LibreOffice
         run: sudo apt-get install -y libreoffice
@@ -377,7 +376,7 @@ def main():
 
         send_message(f"Data loaded for {company_name}. Generating report...")
 
-        text     = generate_report(gathered)
+        text     = generate_report(ASSET, gathered)
         doc_path = export_docx(ASSET, company_name, text, str(REPORTS_DIR))
         pdf_path = export_pdf(doc_path)
 
