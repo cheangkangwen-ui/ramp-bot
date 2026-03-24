@@ -2,2565 +2,400 @@
 RAMP BOT -- FULL RECREATION PROMPT
 ================================================================================
 
-Unified Telegram bot: company equity + macro asset research in one process.
+Unified research bot for company equity + macro asset reports.
+Runs serverless: Cloudflare Worker (webhook) + GitHub Actions (report generation).
 
 HOW IT WORKS:
-1. User uploads optional PDFs/Excels
-2. /load ASSET_OR_TICKER
-   - Matches ASSET_MAP in gather_macro.py -> macro mode (GOLD, EURUSD, SPX, BTC...)
-   - Anything else -> company mode (NVDA, AAPL, MSFT...)
-3. Bot pulls data (15-30s)
-4. /ramp -> Claude Opus 4.6 + extended thinking + web search (3-6 min)
-5. Report sent as text chunks + docx + PDF to:
-   - Company mode: group named "Company Ramp"
-   - Macro mode:   group named "Macro Ramp"
+1. User sends files to bot on Telegram -> files staged in Cloudflare KV (24h TTL)
+2. /ramp ASSET -> Cloudflare Worker triggers GitHub Actions via repository_dispatch
+3. GitHub Actions runs bot_runner.py:
+   - Downloads staged files from Telegram API
+   - Detects mode: macro (ASSET_MAP match) or company (anything else)
+   - Gathers data (yfinance, web search, SEC EDGAR, Telegram digest groups)
+   - Calls Claude Opus 4.6 with extended thinking + web search tool
+   - Exports Word doc + PDF (LibreOffice headless on Linux)
+   - Sends report to Telegram group + back to user chat
+4. Other commands: /status (show staged files), /clear (reset staged files)
+
+ARCHITECTURE:
+- Cloudflare Worker (worker.js) — always-on webhook receiver, stages files in KV
+- GitHub Actions (.github/workflows/ramp.yml) — triggered on demand for report generation
+- No server, no polling, no laptop needed
 
 KEY DESIGN DECISIONS:
-- Single process, one bot token, one startup entry
-- Auto-detect mode via ASSET_MAP lookup
+- Auto-detect mode via ASSET_MAP lookup in gather_macro.py
 - Uploaded files are PRIMARY source for both modes
-- Parallel web search via ThreadPoolExecutor
-- Word doc (.docx) + PDF via python-docx + docx2pdf
+- Parallel web search via ThreadPoolExecutor during Claude report generation
+- Word doc (.docx) via python-docx + PDF via LibreOffice headless
 - Company: 10-part framework | Macro: 11-part framework
-- Company searches "Stock Digest" Telegram group (1 year)
-- Macro searches "News Digest" Telegram group (30 days)
+- Company searches "Stock Digest" Telegram group (1 year history)
+- Macro searches "News Digest" Telegram group (30 days history)
 - ALL reports cite sources inline using [Source: ...] tags
+- Cloudflare KV stages files between messages (send files one by one, then /ramp)
 
 DIRECTORY:
 C:/Users/kangw/ramp-bot/
-  bot.py              # Entry point, routing, all command handlers
-  gather_company.py   # yfinance, SEC EDGAR, web search, transcript, Telegram
-  gather_macro.py     # yfinance price+technicals, web search, Telegram
-  report_company.py   # Claude + 10-part company framework
-  report_macro.py     # Claude + 11-part macro framework
-  tg_group.py         # Unified sender (group_name as param)
-  .env                # Credentials
-  run_bot.bat         # Start script
+  worker.js             # Cloudflare Worker — webhook, KV file staging, triggers GitHub Actions
+  bot_runner.py         # GitHub Actions entry point — downloads files, gathers, reports, sends
+  bot.py                # Legacy local bot entry point (not used in serverless setup)
+  gather_company.py     # yfinance, SEC EDGAR, web search, earnings transcript, Telegram digest
+  gather_macro.py       # yfinance price+technicals, web search, Telegram digest, 150+ assets
+  report_company.py     # Claude Opus + 10-part company framework + web search tool
+  report_macro.py       # Claude Opus + 11-part macro framework + web search tool
+  tg_group.py           # Sends report text + docx + PDF to Telegram groups via Telethon
+  .github/workflows/ramp.yml  # GitHub Actions workflow
+  .env                  # Credentials (local only, gitignored)
+  .gitignore            # Excludes .env, state.json, staged_files/, reports/, SSH/
+  run_bot.bat           # Legacy local start script (not used in serverless setup)
 
-DEPENDENCIES:
-pip install python-telegram-bot telethon anthropic yfinance pandas pdfplumber python-docx docx2pdf duckduckgo-search python-dotenv requests beautifulsoup4
+DEPENDENCIES (installed in GitHub Actions):
+pip install anthropic yfinance pandas pdfplumber python-docx \
+  duckduckgo-search requests beautifulsoup4 telethon python-dotenv
++ sudo apt-get install -y libreoffice
 
-.env:
-BOT_TOKEN=<from @BotFather>
-TELEGRAM_CHAT_ID=233058647
-ANTHROPIC_API_KEY=<anthropic key>
-TELEGRAM_SESSION=<telethon session string>
+SECRETS & ENVIRONMENT:
+
+GitHub Secrets (Settings -> Secrets and variables -> Actions):
+  ANTHROPIC_API_KEY    — Claude API key
+  BOT_TOKEN            — Telegram bot token from @BotFather
+  TELEGRAM_SESSION     — Telethon session string for group access
+
+Cloudflare Worker Environment Variables:
+  BOT_TOKEN            — Telegram bot token
+  GITHUB_TOKEN         — GitHub personal access token (repo scope)
+  GITHUB_REPO          — cheangkangwen-ui/ramp-bot
+  ALLOWED_CHAT_ID      — Telegram chat ID (233058647) or remove for open access
+
+Cloudflare Worker KV Binding:
+  RAMP_KV              — KV namespace for staging files between messages
+
+Telegram Webhook:
+  Set via: https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=<WORKER_URL>
+  Current worker URL: https://autumn-leaf-2c5a.cheangkangwen.workers.dev
+
+GitHub Repo: https://github.com/cheangkangwen-ui/ramp-bot
 
 ================================================================================
-FILE: C:/Users/kangw/ramp-bot/bot.py
+FILE: worker.js (Cloudflare Worker)
+================================================================================
+/**
+ * Cloudflare Worker — receives Telegram webhook, triggers GitHub Actions.
+ *
+ * Commands:
+ *   Send file(s)       — bot saves them to KV (with optional caption as context note)
+ *   /ramp ASSET        — generate report using any staged files + asset
+ *   /clear             — clear staged files
+ *   /status            — show staged files
+ *
+ * Environment variables (set in Cloudflare Worker settings):
+ *   BOT_TOKEN       — Telegram bot token
+ *   GITHUB_TOKEN    — GitHub personal access token (repo scope)
+ *   GITHUB_REPO     — e.g. "yourusername/ramp-bot"
+ *   ALLOWED_CHAT_ID — your Telegram chat ID (233058647)
+ *
+ * KV Binding (set in Cloudflare Worker settings):
+ *   RAMP_KV — KV namespace for staging files between messages
+ */
+
+export default {
+  async fetch(request, env) {
+    if (request.method !== "POST") return new Response("ok");
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("ok");
+    }
+
+    const message = body.message;
+    if (!message) return new Response("ok");
+
+    const chat_id = String(message.chat.id);
+
+    // Auth check
+    if (env.ALLOWED_CHAT_ID && chat_id !== String(env.ALLOWED_CHAT_ID)) {
+      return new Response("ok");
+    }
+
+    const text = message.text || message.caption || "";
+
+    // ── /clear ───────────────────────────────────────────────────────────────
+    if (text.trim() === "/clear") {
+      await env.RAMP_KV.delete(`files:${chat_id}`);
+      await sendMessage(env.BOT_TOKEN, chat_id, "Cleared. Staged files reset.");
+      return new Response("ok");
+    }
+
+    // ── /status ──────────────────────────────────────────────────────────────
+    if (text.trim() === "/status") {
+      const staged = await getStaged(env, chat_id);
+      if (staged.length === 0) {
+        await sendMessage(env.BOT_TOKEN, chat_id, "No files staged. Send files then /ramp ASSET.");
+      } else {
+        const names = staged.map(f => `- ${f.file_name}`).join("\n");
+        await sendMessage(env.BOT_TOKEN, chat_id, `Staged files (${staged.length}):\n${names}\n\nSend /ramp ASSET to generate report.`);
+      }
+      return new Response("ok");
+    }
+
+    // ── File upload — stage it ────────────────────────────────────────────────
+    if (message.document) {
+      const file_id   = message.document.file_id;
+      const file_name = message.document.file_name || "upload";
+      const caption   = (message.caption || "").replace(/\/ramp\s+\S+\s*/i, "").trim();
+
+      const staged = await getStaged(env, chat_id);
+      // Avoid duplicates by file_name
+      const exists = staged.findIndex(f => f.file_name === file_name);
+      if (exists >= 0) staged[exists] = { file_id, file_name, caption };
+      else staged.push({ file_id, file_name, caption });
+
+      await env.RAMP_KV.put(`files:${chat_id}`, JSON.stringify(staged), { expirationTtl: 86400 }); // 24h TTL
+
+      await sendMessage(env.BOT_TOKEN, chat_id,
+        `Staged: ${file_name}${caption ? `\nNote: ${caption}` : ""}\nTotal staged: ${staged.length} file(s)\n\nSend more files or /ramp ASSET to generate report.`
+      );
+      return new Response("ok");
+    }
+
+    // ── /ramp ASSET ──────────────────────────────────────────────────────────
+    const match = text.match(/\/ramp\s+(\S+)/i);
+    if (!match) return new Response("ok");
+
+    const asset  = match[1].toUpperCase();
+    const staged = await getStaged(env, chat_id);
+
+    await sendMessage(env.BOT_TOKEN, chat_id,
+      `Generating report for ${asset}...${staged.length > 0 ? `\nUsing ${staged.length} staged file(s).` : ""}\nThis takes 5-8 minutes.`
+    );
+
+    // Trigger GitHub Actions
+    const resp = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `token ${env.GITHUB_TOKEN}`,
+          Accept: "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+          "User-Agent": "ramp-bot-worker",
+        },
+        body: JSON.stringify({
+          event_type: "ramp",
+          client_payload: {
+            asset,
+            chat_id,
+            staged_files: staged, // array of {file_id, file_name, caption}
+          },
+        }),
+      }
+    );
+
+    if (!resp.ok) {
+      const err = await resp.text();
+      await sendMessage(env.BOT_TOKEN, chat_id, `Failed to start report: ${err}`);
+    }
+
+    // Clear staged files after dispatching
+    await env.RAMP_KV.delete(`files:${chat_id}`);
+
+    return new Response("ok");
+  },
+};
+
+
+async function getStaged(env, chat_id) {
+  const raw = await env.RAMP_KV.get(`files:${chat_id}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function sendMessage(token, chat_id, text) {
+  return fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id, text }),
+  });
+}
+
+================================================================================
+FILE: .github/workflows/ramp.yml
+================================================================================
+name: Ramp Report
+
+on:
+  repository_dispatch:
+    types: [ramp]
+
+jobs:
+  ramp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          pip install anthropic yfinance pandas pdfplumber python-docx \
+            duckduckgo-search requests beautifulsoup4 telethon python-dotenv
+
+      - name: Install LibreOffice
+        run: sudo apt-get install -y libreoffice
+
+      - name: Run ramp
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
+          ASSET:         ${{ github.event.client_payload.asset }}
+          CHAT_ID:       ${{ github.event.client_payload.chat_id }}
+          STAGED_FILES:  ${{ toJson(github.event.client_payload.staged_files) }}
+        run: python bot_runner.py
+
+================================================================================
+FILE: bot_runner.py
 ================================================================================
 """
-Ramp Bot — unified company + macro research bot.
-Commands: /load ASSET_OR_TICKER  /ramp  /status  /clear
-
-Auto-detects mode:
-  - Known macro asset (GOLD, EURUSD, SPX, US10Y, BTC, ...) → macro mode
-  - Anything else (NVDA, AAPL, MSFT, ...) → company mode
+Serverless runner — called by GitHub Actions.
+Reads asset + optional file info from env vars, gathers data, generates report, sends to Telegram.
 """
 
-import asyncio
-import json
-import logging
 import os
+import sys
+import requests
 from pathlib import Path
 
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+CHAT_ID       = os.environ["CHAT_ID"]
+ASSET         = os.environ["ASSET"]
+STAGED_FILES_JSON = os.environ.get("STAGED_FILES", "[]")  # JSON array of {file_id, file_name, caption}
 
-load_dotenv()
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
-
-BASE_DIR    = Path(__file__).parent
-STAGED_DIR  = BASE_DIR / "staged_files"
-REPORTS_DIR = BASE_DIR / "reports"
-STATE_FILE  = BASE_DIR / "state.json"
-
-STAGED_DIR.mkdir(exist_ok=True)
+REPORTS_DIR = Path("reports")
+STAGED_DIR  = Path("staged_files")
 REPORTS_DIR.mkdir(exist_ok=True)
-
-COMPANY_GROUP = "📊 Company Ramp"
-MACRO_GROUP   = "📊 Macro Ramp"
+STAGED_DIR.mkdir(exist_ok=True)
 
 
-# ── Mode detection ───────────────────────────────────────────────────────────────
+def send_message(text: str):
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text},
+    )
 
-def detect_mode(asset_input: str) -> str:
-    """Return 'macro' if asset_input matches a known macro asset, else 'company'."""
+
+def send_document(file_path: str, caption: str = ""):
+    with open(file_path, "rb") as f:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+            data={"chat_id": CHAT_ID, "caption": caption},
+            files={"document": f},
+        )
+
+
+def download_files() -> tuple[list, dict]:
+    """Download all staged files from Telegram."""
+    import json
+    staged = json.loads(STAGED_FILES_JSON)
+    if not staged:
+        return [], {}
+    local_paths = []
+    captions = {}
+    for f in staged:
+        file_id   = f.get("file_id", "")
+        file_name = f.get("file_name", "upload")
+        caption   = f.get("caption", "")
+        if not file_id:
+            continue
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                params={"file_id": file_id},
+            )
+            tg_path = r.json()["result"]["file_path"]
+            content = requests.get(
+                f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_path}"
+            ).content
+            local_path = STAGED_DIR / file_name
+            local_path.write_bytes(content)
+            local_paths.append(str(local_path))
+            if caption:
+                captions[str(local_path)] = caption
+            print(f"  Downloaded: {file_name} ({len(content):,} bytes)")
+        except Exception as e:
+            print(f"  Failed to download {file_name}: {e}")
+    return local_paths, captions
+
+
+def detect_mode(asset: str) -> str:
     from gather_macro import ASSET_MAP
-    key = asset_input.upper().replace("/", "").replace("-", "").replace(".", "")
+    key = asset.upper().replace("/", "").replace("-", "").replace(".", "")
     return "macro" if key in ASSET_MAP else "company"
 
 
-# ── State helpers ────────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {"mode": None, "asset": None, "staged_files": [], "staged_captions": {}, "context": None}
-
-
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-
-
-def is_authorized(update: Update) -> bool:
-    return CHAT_ID == 0 or update.effective_chat.id == CHAT_ID
-
-
-# ── Commands ─────────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    await update.message.reply_text(
-        "Ramp Bot\n\n"
-        "/load ASSET — load data for a company or macro asset\n"
-        "/ramp       — generate report (~3-6 min)\n"
-        "/status     — show current state\n"
-        "/clear      — reset state\n\n"
-        "COMPANIES: any ticker (NVDA, AAPL, TSLA, MSFT, ...)\n\n"
-        "PRECIOUS METALS: GOLD SILVER PLATINUM PALLADIUM GDX GDXJ\n"
-        "ENERGY: WTI BRENT NATGAS RBOB HEATINGOIL\n"
-        "BASE METALS: COPPER ALUMINUM\n"
-        "AGRICULTURAL: WHEAT CORN SOYBEAN COFFEE SUGAR COCOA COTTON CATTLE HOGS\n\n"
-        "US RATES: US2Y US5Y US10Y US30Y TLT IEF SHY HYG LQD TIPS\n"
-        "GLOBAL RATES: BUND GILT JGB\n\n"
-        "G10 FX: EURUSD USDJPY GBPUSD AUDUSD NZDUSD USDCAD USDCHF DXY\n"
-        "CROSSES: EURJPY EURGBP GBPJPY AUDJPY\n"
-        "EM FX: USDCNY USDINR USDBRL USDMXN USDZAR USDTRY USDKRW USDSGD\n\n"
-        "US INDEXES: SPX NDX DOW RUSSELL VIX\n"
-        "EUROPE: FTSE DAX CAC IBEX SMI AEX STOXX50\n"
-        "ASIA-PAC: NIKKEI HSI CSI300 KOSPI ASX200 SENSEX NIFTY\n"
-        "EM: BOVESPA MEXBOL EEM\n\n"
-        "CRYPTO: BTC ETH SOL XRP\n\n"
-        "Any yfinance ticker also works (e.g. /load GC=F, /load ^TNX)"
-    )
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    state = load_state()
-    asset  = state.get("asset") or "None"
-    mode   = state.get("mode") or "None"
-    staged = state.get("staged_files", [])
-    loaded = "Yes" if state.get("context") else "No"
-    ctx    = state.get("context", {})
-
-    msg = f"Mode: {mode}\nAsset: {asset}\nData loaded: {loaded}\nStaged files: {len(staged)}"
-    if ctx:
-        display = ctx.get("display_name") or ctx.get("company_name", "")
-        if display:
-            msg += f"\nDisplay name: {display}"
-    for f in staged:
-        msg += f"\n  - {Path(f).name}"
-    await update.message.reply_text(msg)
-
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    for f in STAGED_DIR.iterdir():
-        try:
-            f.unlink()
-        except Exception:
-            pass
-    save_state({"mode": None, "asset": None, "staged_files": [], "staged_captions": {}, "context": None})
-    await update.message.reply_text("Cleared. State and staged files reset.")
-
-
-async def cmd_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /load ASSET  (e.g. /load NVDA, /load GOLD, /load EURUSD)")
-        return
-
-    asset_input = args[0].upper().strip()
-    mode = detect_mode(asset_input)
-    state = load_state()
-    staged_files    = state.get("staged_files", [])
-    staged_captions = state.get("staged_captions", {})
-
-    if mode == "macro":
-        from gather_macro import resolve_asset
-        yf_ticker, display_name, asset_type = resolve_asset(asset_input)
-        await update.message.reply_text(
-            f"Mode: MACRO\n"
-            f"Loading {display_name} ({yf_ticker}) [{asset_type}]...\n"
-            f"Sources: yfinance, web search, News Digest (Telegram)"
-            + (f", {len(staged_files)} uploaded file(s)" if staged_files else "") + "\n"
-            "~15 seconds."
-        )
-        loop = asyncio.get_event_loop()
-        def _gather():
-            from gather_macro import gather_all
-            return gather_all(asset_input, staged_files, staged_captions)
-    else:
-        await update.message.reply_text(
-            f"Mode: COMPANY\n"
-            f"Loading {asset_input}...\n"
-            f"Sources: yfinance, SEC EDGAR, web search, Stock Digest (Telegram)"
-            + (f", {len(staged_files)} uploaded file(s)" if staged_files else "") + "\n"
-            "~30 seconds."
-        )
-        loop = asyncio.get_event_loop()
-        def _gather():
-            from gather_company import gather_all
-            return gather_all(asset_input, staged_files, staged_captions)
-
-    try:
-        gathered = await loop.run_in_executor(None, _gather)
-        state["mode"]    = mode
-        state["asset"]   = asset_input
-        state["context"] = gathered
-        save_state(state)
-
-        if mode == "macro":
-            display_name = gathered.get("display_name", asset_input)
-            asset_type   = gathered.get("asset_type", "")
-            await update.message.reply_text(
-                f"Loaded: {display_name} ({asset_input}) [{asset_type}]\n"
-                "Send /ramp to generate the report."
-            )
-        else:
-            company_name = gathered.get("company_name", asset_input)
-            await update.message.reply_text(
-                f"Loaded: {company_name} ({asset_input})\n"
-                "Send /ramp to generate the report."
-            )
-    except Exception as e:
-        logger.exception("Load failed")
-        await update.message.reply_text(f"Load failed: {e}")
-
-
-async def cmd_ramp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    state = load_state()
-    if not state.get("context"):
-        await update.message.reply_text("No data loaded. Run /load ASSET first.")
-        return
-
-    gathered    = state["context"]
-    asset_input = state["asset"]
-    mode        = state["mode"]
-
-    if mode == "macro":
-        display_name = gathered.get("display_name", asset_input)
-        asset_type   = gathered.get("asset_type", "")
-        await update.message.reply_text(
-            f"Generating macro ramp report for {display_name} ({asset_input}) [{asset_type}]...\n"
-            "Claude is researching with web search. 3-6 minutes."
-        )
-    else:
-        company_name = gathered.get("company_name", asset_input)
-        await update.message.reply_text(
-            f"Generating company ramp report for {company_name} ({asset_input})...\n"
-            "Claude is researching with web search. 3-6 minutes."
-        )
-
-    loop = asyncio.get_event_loop()
-
-    def _generate():
-        from tg_group import send_to_group
-        if mode == "macro":
-            from report_macro import generate_report, export_docx, export_pdf
-            display_name = gathered.get("display_name", asset_input)
-            asset_type   = gathered.get("asset_type", "")
-            text     = generate_report(gathered)
-            doc_path = export_docx(asset_input, display_name, text, str(REPORTS_DIR))
-            pdf_path = export_pdf(doc_path)
-            send_to_group(text, doc_path, pdf_path, display_name, asset_input,
-                          MACRO_GROUP, "Macro asset ramp research reports")
-            return text, doc_path, pdf_path
-        else:
-            from report_company import generate_report, export_docx, export_pdf
-            company_name = gathered.get("company_name", asset_input)
-            text     = generate_report(gathered)
-            doc_path = export_docx(asset_input, company_name, text, str(REPORTS_DIR))
-            pdf_path = export_pdf(doc_path)
-            send_to_group(text, doc_path, pdf_path, company_name, asset_input,
-                          COMPANY_GROUP, "Company ramp research reports")
-            return text, doc_path, pdf_path
-
-    try:
-        report_text, doc_path, pdf_path = await loop.run_in_executor(None, _generate)
-
-        with open(doc_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=Path(doc_path).name,
-                caption="Report sent to group. Word doc attached.",
-            )
-        with open(pdf_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=Path(pdf_path).name,
-                caption="PDF version.",
-            )
-
-        logger.info(f"Report sent for {asset_input} ({mode}), doc: {doc_path}")
-
-    except Exception as e:
-        logger.exception("Report generation failed")
-        await update.message.reply_text(f"Report generation failed: {e}")
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stage uploaded PDF, Excel, or CSV files."""
-    if not is_authorized(update):
-        return
-
-    doc = update.message.document
-    if not doc:
-        return
-
-    fname = doc.file_name or f"upload_{doc.file_id}"
-    ext   = Path(fname).suffix.lower()
-    supported = {".pdf", ".xlsx", ".xls", ".csv"}
-
-    if ext not in supported:
-        await update.message.reply_text(
-            f"Unsupported file type: {ext}\nSupported: PDF, Excel (.xlsx/.xls), CSV"
-        )
-        return
-
-    save_path = STAGED_DIR / fname
-    tg_file   = await context.bot.get_file(doc.file_id)
-    await tg_file.download_to_drive(str(save_path))
-
-    caption = update.message.caption or ""
-
-    state    = load_state()
-    staged   = state.get("staged_files", [])
-    captions = state.get("staged_captions", {})
-
-    if str(save_path) not in staged:
-        staged.append(str(save_path))
-    if caption:
-        captions[str(save_path)] = caption
-
-    state["staged_files"]    = staged
-    state["staged_captions"] = captions
-    save_state(state)
-
-    await update.message.reply_text(
-        f"Staged: {fname}"
-        + (f"\nContext: {caption}" if caption else "") +
-        f"\nTotal staged: {len(staged)} file(s)\n\n"
-        "Run /load ASSET to include these in the data pull."
-    )
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────────
-
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not set in .env")
+    print(f"Asset: {ASSET}")
+    staged_files, staged_captions = download_files()
+    mode = detect_mode(ASSET)
+    print(f"Mode: {mode}")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    if mode == "macro":
+        from gather_macro import gather_all, resolve_asset
+        from report_macro import generate_report, export_docx, export_pdf
+        from tg_group import send_to_group
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
-    app.add_handler(CommandHandler("load",   cmd_load))
-    app.add_handler(CommandHandler("ramp",   cmd_ramp))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        gathered     = gather_all(ASSET, staged_files, staged_captions)
+        display_name = gathered.get("display_name", ASSET)
+        asset_type   = gathered.get("asset_type", "")
 
-    logger.info("Ramp Bot started.")
-    app.run_polling()
+        send_message(f"Data loaded for {display_name}. Generating report...")
+
+        text     = generate_report(gathered)
+        doc_path = export_docx(ASSET, display_name, text, str(REPORTS_DIR))
+        pdf_path = export_pdf(doc_path)
+
+        send_to_group(text, doc_path, pdf_path, display_name, ASSET,
+                      "Macro Ramp", "Macro ramp research reports")
+        send_document(doc_path, f"Macro report: {display_name} ({ASSET})")
+        send_document(pdf_path, "PDF version")
+
+    else:
+        from gather_company import gather_all
+        from report_company import generate_report, export_docx, export_pdf
+        from tg_group import send_to_group
+
+        gathered     = gather_all(ASSET, staged_files, staged_captions)
+        company_name = gathered.get("company_name", ASSET)
+
+        send_message(f"Data loaded for {company_name}. Generating report...")
+
+        text     = generate_report(gathered)
+        doc_path = export_docx(ASSET, company_name, text, str(REPORTS_DIR))
+        pdf_path = export_pdf(doc_path)
+
+        send_to_group(text, doc_path, pdf_path, company_name, ASSET,
+                      "Company Ramp", "Company ramp research reports")
+        send_document(doc_path, f"Company report: {company_name} ({ASSET})")
+        send_document(pdf_path, "PDF version")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        send_message(f"Report failed for {ASSET}: {e}")
+        sys.exit(1)
 
 ================================================================================
-FILE: C:/Users/kangw/ramp-bot/gather_company.py
-================================================================================
-"""
-Data gathering for company ramp.
-Pulls: yfinance financials/stats, SEC EDGAR filings (actual content),
-DuckDuckGo news search, earnings transcript (Quartr → SEC exhibit → web),
-and user-uploaded PDFs/Excels.
-"""
-
-import os
-import re
-import json
-import requests
-import pdfplumber
-import yfinance as yf
-import pandas as pd
-from pathlib import Path
-
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
-
-MAX_CHARS_YFINANCE = 10000
-MAX_CHARS_NEWS = 8000
-MAX_CHARS_PRESS_RELEASE = 8000
-MAX_CHARS_10Q = 8000
-MAX_CHARS_10K = 5000
-MAX_CHARS_TRANSCRIPT = 14000
-MAX_CHARS_FILE = 8000
-
-EDGAR_HEADERS = {"User-Agent": "company-ramp-bot kangw@personal.com"}
-QUARTR_API_BASE = "https://api.quartr.com/public/v3"
-
-
-# ── Web search ─────────────────────────────────────────────────────────────────
-
-def web_search(query: str, max_results: int = 6) -> str:
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        if not results:
-            return "No results found."
-        return "\n\n".join(
-            f"**{r['title']}**\n{r['href']}\n{r['body']}" for r in results
-        )
-    except Exception as e:
-        return f"Search failed: {e}"
-
-
-def gather_news(ticker: str, company_name: str) -> str:
-    queries = [
-        f"{ticker} {company_name} stock news earnings 2025",
-        f"{ticker} {company_name} analyst rating price target",
-        f"{company_name} industry competition market share outlook",
-        f"{ticker} management CEO strategy recent",
-    ]
-    parts = []
-    for q in queries:
-        result = web_search(q, max_results=5)
-        parts.append(f"### Search: {q}\n{result}")
-    full = "\n\n".join(parts)
-    if len(full) > MAX_CHARS_NEWS:
-        full = full[:MAX_CHARS_NEWS] + "\n\n[... truncated ...]"
-    return full
-
-
-# ── Yahoo Finance ──────────────────────────────────────────────────────────────
-
-def gather_yfinance(ticker: str) -> str:
-    t = yf.Ticker(ticker)
-    parts = []
-
-    try:
-        info = t.info
-        parts.append("## Company Info")
-        for key in [
-            "longName", "sector", "industry", "longBusinessSummary",
-            "fullTimeEmployees", "country", "website",
-            "marketCap", "enterpriseValue",
-        ]:
-            val = info.get(key)
-            if val:
-                parts.append(f"{key}: {val}")
-
-        parts.append("\n## Key Statistics")
-        for key in [
-            "currentPrice", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
-            "fiftyDayAverage", "twoHundredDayAverage",
-            "trailingPE", "forwardPE", "priceToBook", "priceToSalesTrailing12Months",
-            "enterpriseToEbitda", "enterpriseToRevenue",
-            "beta", "52WeekChange",
-            "shortPercentOfFloat", "shortRatio",
-            "heldPercentInstitutions", "heldPercentInsiders",
-            "dividendYield", "payoutRatio",
-            "returnOnEquity", "returnOnAssets",
-            "profitMargins", "operatingMargins", "grossMargins",
-            "revenueGrowth", "earningsGrowth",
-            "totalDebt", "totalCash", "debtToEquity", "currentRatio",
-            "targetHighPrice", "targetLowPrice", "targetMeanPrice",
-            "numberOfAnalystOpinions", "recommendationMean", "recommendationKey",
-        ]:
-            val = info.get(key)
-            if val is not None:
-                parts.append(f"{key}: {val}")
-    except Exception as e:
-        parts.append(f"Info fetch failed: {e}")
-
-    for label, attr in [
-        ("Income Statement (Annual)", "income_stmt"),
-        ("Balance Sheet (Annual)", "balance_sheet"),
-        ("Cash Flow (Annual)", "cash_flow"),
-    ]:
-        try:
-            df = getattr(t, attr)
-            if df is not None and not df.empty:
-                parts.append(f"\n## {label}")
-                parts.append(df.to_string())
-        except Exception:
-            pass
-
-    try:
-        eh = t.earnings_history
-        if eh is not None and not eh.empty:
-            parts.append("\n## Earnings History (last 8 quarters)")
-            parts.append(eh.tail(8).to_string())
-    except Exception:
-        pass
-
-    try:
-        recs = t.recommendations
-        if recs is not None and not recs.empty:
-            parts.append("\n## Analyst Recommendations (recent)")
-            parts.append(recs.tail(10).to_string())
-    except Exception:
-        pass
-
-    try:
-        cal = t.calendar
-        if cal:
-            parts.append("\n## Earnings Calendar")
-            parts.append(str(cal))
-    except Exception:
-        pass
-
-    try:
-        hist = t.history(period="6mo")
-        if not hist.empty:
-            parts.append("\n## Price History (6mo, weekly close)")
-            weekly = hist["Close"].resample("W").last()
-            parts.append(weekly.to_string())
-    except Exception:
-        pass
-
-    result = "\n".join(parts)
-    if len(result) > MAX_CHARS_YFINANCE:
-        result = result[:MAX_CHARS_YFINANCE] + "\n\n[... truncated ...]"
-    return result
-
-
-# ── SEC EDGAR helpers ──────────────────────────────────────────────────────────
-
-def get_cik(ticker: str) -> str | None:
-    """Look up CIK from EDGAR company ticker mapping."""
-    try:
-        resp = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=EDGAR_HEADERS, timeout=15,
-        )
-        if resp.status_code == 200:
-            for entry in resp.json().values():
-                if entry.get("ticker", "").upper() == ticker.upper():
-                    return str(entry["cik_str"]).zfill(10)
-    except Exception:
-        pass
-    return None
-
-
-def _fetch_limited(url: str, max_bytes: int = 400_000) -> bytes | None:
-    """Download a URL, stopping after max_bytes to avoid huge filings."""
-    try:
-        resp = requests.get(url, headers=EDGAR_HEADERS, timeout=30, stream=True)
-        if resp.status_code != 200:
-            return None
-        chunks = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=16384):
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_bytes:
-                break
-        return b"".join(chunks)
-    except Exception:
-        return None
-
-
-def _html_to_text(html: str) -> str:
-    """Convert HTML to readable plain text, preserving table structure."""
-    if HAS_BS4:
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "head"]):
-            tag.decompose()
-        # Render tables as pipe-delimited rows
-        for table in soup.find_all("table"):
-            rows_text = []
-            for tr in table.find_all("tr"):
-                cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-                if any(cells):
-                    rows_text.append(" | ".join(cells))
-            table.replace_with("\n".join(rows_text) + "\n")
-        text = soup.get_text(separator="\n", strip=True)
-    else:
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"&nbsp;", " ", text)
-        text = re.sub(r"&amp;", "&", text)
-        text = re.sub(r"&lt;", "<", text)
-        text = re.sub(r"&gt;", ">", text)
-        text = re.sub(r"&#\d+;", " ", text)
-
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def _find_financial_section(text: str) -> str:
-    """Seek to the income statement / results section within a stripped filing."""
-    markers = [
-        "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS",
-        "CONSOLIDATED STATEMENTS OF OPERATIONS",
-        "CONSOLIDATED STATEMENTS OF INCOME",
-        "RESULTS OF OPERATIONS",
-        "FINANCIAL HIGHLIGHTS",
-        "SELECTED FINANCIAL DATA",
-    ]
-    upper = text.upper()
-    best = len(text)
-    for m in markers:
-        pos = upper.find(m)
-        if 0 <= pos < best:
-            best = pos
-    return text[best:] if best < len(text) else text
-
-
-def _get_filing_docs(cik: str, accession: str) -> list[tuple[str, str]]:
-    """Return list of (filename, url) from the filing's EDGAR index page."""
-    acc_clean = accession.replace("-", "")
-    base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/"
-    try:
-        resp = requests.get(base, headers=EDGAR_HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return []
-        docs = []
-        for m in re.finditer(r'href="([^"?#][^"]*)"', resp.text):
-            href = m.group(1)
-            if not href.startswith("/") and not href.startswith("http"):
-                docs.append((href, base + href))
-        return docs
-    except Exception:
-        return []
-
-
-def _find_exhibit(docs: list, patterns: list) -> tuple[str | None, str | None]:
-    """Find first document whose filename matches any regex pattern."""
-    for filename, url in docs:
-        for pat in patterns:
-            if re.search(pat, filename, re.IGNORECASE):
-                return filename, url
-    return None, None
-
-
-# ── SEC EDGAR — download actual filing content ─────────────────────────────────
-
-def gather_sec(ticker: str) -> str:
-    cik = get_cik(ticker)
-    if not cik:
-        return f"Could not find SEC CIK for {ticker}. Ticker may be non-US or delisted."
-
-    try:
-        resp = requests.get(
-            f"https://data.sec.gov/submissions/CIK{cik}.json",
-            headers=EDGAR_HEADERS, timeout=15,
-        )
-        meta = resp.json()
-    except Exception as e:
-        return f"SEC EDGAR fetch failed: {e}"
-
-    company_name = meta.get("name", ticker)
-    recent = meta.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    accessions = recent.get("accessionNumber", [])
-    dates = recent.get("filingDate", [])
-    primary_docs = recent.get("primaryDocument", [])
-
-    parts = [f"# SEC EDGAR — {company_name} (CIK: {cik})"]
-
-    targets = [
-        ("8-K",  MAX_CHARS_PRESS_RELEASE, "press_release"),
-        ("10-Q", MAX_CHARS_10Q,           "quarterly"),
-        ("10-K", MAX_CHARS_10K,           "annual"),
-    ]
-
-    for target_form, max_chars, mode in targets:
-        for i, form in enumerate(forms[:40]):
-            if form != target_form:
-                continue
-
-            acc = accessions[i]
-            date = dates[i]
-            primary_doc = primary_docs[i]
-            acc_clean = acc.replace("-", "")
-            cik_int = int(cik)
-
-            parts.append(f"\n## {target_form} — filed {date}")
-
-            try:
-                if mode == "press_release":
-                    # Discover the press release exhibit (ex99.1) within the 8-K
-                    docs = _get_filing_docs(cik, acc)
-                    pr_name, pr_url = _find_exhibit(docs, [
-                        r"ex99.*earnings", r"ex99.*press", r"ex99.*result",
-                        r"ex991\b", r"ex-991\b", r"exhibit.?99",
-                        r"pressrelease", r"press.?release",
-                    ])
-                    if pr_url:
-                        fetch_url = pr_url
-                        parts.append(f"Source: press release exhibit ({pr_name})")
-                    else:
-                        fetch_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}/{primary_doc}"
-                        parts.append(f"Source: primary 8-K document ({primary_doc}) — no exhibit found")
-                else:
-                    fetch_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}/{primary_doc}"
-                    parts.append(f"Source: {primary_doc}")
-
-                raw = _fetch_limited(fetch_url, max_bytes=500_000)
-                if raw is None:
-                    parts.append("[Download failed]")
-                    break
-
-                decoded = raw.decode("utf-8", errors="ignore")
-                if "<html" in decoded.lower() or primary_doc.lower().endswith(".htm"):
-                    text = _html_to_text(decoded)
-                else:
-                    text = decoded
-
-                if mode in ("quarterly", "annual"):
-                    text = _find_financial_section(text)
-
-                text = re.sub(r"\n{3,}", "\n\n", text).strip()
-                if len(text) > max_chars:
-                    text = text[:max_chars] + "\n\n[... truncated ...]"
-
-                parts.append(text)
-
-            except Exception as e:
-                parts.append(f"[Error: {e}]")
-
-            break  # most recent filing only
-
-    return "\n\n".join(parts)
-
-
-# ── Earnings transcript — Quartr → SEC exhibit → web ──────────────────────────
-
-def _transcript_from_quartr(ticker: str) -> str | None:
-    """Download the most recent earnings call transcript from Quartr API."""
-    api_key = os.getenv("QUARTR_API_KEY", "").strip()
-    if not api_key:
-        return None
-
-    try:
-        url = (f"{QUARTR_API_BASE}/documents/transcripts"
-               f"?tickers={ticker}&direction=desc&expand=event&limit=10")
-        resp = requests.get(url, headers={"x-api-key": api_key}, timeout=20)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-    except Exception:
-        return None
-
-    # Filter to earnings calls
-    earnings_type_ids = {26, 27, 28, 29, 35, 36}
-    transcripts = [
-        d for d in data.get("data", [])
-        if d.get("event", {}).get("typeId") in earnings_type_ids
-    ]
-    if not transcripts:
-        return None
-
-    # Dedupe by eventId, prefer typeId=22 (in-house)
-    seen = {}
-    for d in transcripts:
-        eid = d["eventId"]
-        if eid not in seen or (d["typeId"] == 22 and seen[eid]["typeId"] != 22):
-            seen[eid] = d
-    latest = sorted(seen.values(), key=lambda d: d["event"]["date"], reverse=True)[0]
-
-    evt = latest.get("event", {})
-    file_url = latest.get("fileUrl")
-    if not file_url:
-        return None
-
-    try:
-        tj = requests.get(file_url, timeout=30).json()
-    except Exception:
-        return None
-
-    # Build speaker map
-    speaker_map = {}
-    for entry in tj.get("speaker_mapping", []):
-        idx = entry["speaker"]
-        sd = entry.get("speaker_data", {})
-        name = sd.get("name", f"Speaker {idx}")
-        role = sd.get("role", "")
-        company = sd.get("company", "")
-        if role and company:
-            label = f"{name}, {role} ({company})"
-        elif role:
-            label = f"{name}, {role}"
-        else:
-            label = name
-        speaker_map[idx] = label
-
-    paragraphs = tj.get("transcript", {}).get("paragraphs", [])
-    lines = [
-        f"# Earnings Call Transcript — {evt.get('title', ticker)} "
-        f"({evt.get('date', '')[:10]})",
-        f"Source: Quartr\n",
-    ]
-    last_speaker = None
-    for para in paragraphs:
-        spk = para.get("speaker")
-        text = para.get("text", "").strip()
-        if not text:
-            continue
-        if spk != last_speaker:
-            lines.append(f"\n{speaker_map.get(spk, f'Speaker {spk}')}:")
-            last_speaker = spk
-        lines.append(text)
-
-    return "\n".join(lines)
-
-
-def _transcript_from_sec_exhibit(ticker: str) -> str | None:
-    """Look for a transcript exhibit (ex99.2 or similar) in the most recent 8-K."""
-    cik = get_cik(ticker)
-    if not cik:
-        return None
-
-    try:
-        resp = requests.get(
-            f"https://data.sec.gov/submissions/CIK{cik}.json",
-            headers=EDGAR_HEADERS, timeout=15,
-        )
-        recent = resp.json().get("filings", {}).get("recent", {})
-    except Exception:
-        return None
-
-    forms = recent.get("form", [])
-    accessions = recent.get("accessionNumber", [])
-    dates = recent.get("filingDate", [])
-
-    for i, form in enumerate(forms[:20]):
-        if form != "8-K":
-            continue
-        docs = _get_filing_docs(cik, accessions[i])
-        name, url = _find_exhibit(docs, [
-            r"ex99.*transcript", r"ex992\b", r"ex-992\b",
-            r"transcript", r"exhibit.?99.?2",
-        ])
-        if not url:
-            continue
-        raw = _fetch_limited(url, max_bytes=300_000)
-        if raw is None:
-            continue
-        decoded = raw.decode("utf-8", errors="ignore")
-        text = _html_to_text(decoded) if "<html" in decoded.lower() else decoded
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return (
-            f"# Earnings Call Transcript — {ticker} 8-K {dates[i]}\n"
-            f"Source: SEC EDGAR exhibit ({name})\n\n{text}"
-        )
-
-    return None
-
-
-def _transcript_from_audio(ticker: str) -> str | None:
-    """Find the earnings call audio/video URL from Quartr events and transcribe via Whisper API.
-
-    Requires QUARTR_API_KEY (to find the recording URL) and OPENAI_API_KEY (for Whisper).
-    Downloads up to 25 MB of audio to stay within Whisper's file size limit.
-    """
-    quartr_key = os.getenv("QUARTR_API_KEY", "").strip()
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not quartr_key or not openai_key:
-        return None
-
-    # Find the most recent earnings event with a recording URL
-    try:
-        url = (f"{QUARTR_API_BASE}/events"
-               f"?tickers={ticker}&direction=desc&limit=10")
-        resp = requests.get(url, headers={"x-api-key": quartr_key}, timeout=20)
-        if resp.status_code != 200:
-            return None
-        events = resp.json().get("data", [])
-    except Exception:
-        return None
-
-    earnings_type_ids = {26, 27, 28, 29, 35, 36}
-    audio_url = None
-    event_title = ticker
-    event_date = ""
-
-    for evt in events:
-        if evt.get("typeId") not in earnings_type_ids:
-            continue
-        # Look for any audio/video recording URL in the event
-        for field in ("audioUrl", "recordingUrl", "videoUrl", "mediaUrl"):
-            candidate = evt.get(field)
-            if candidate:
-                audio_url = candidate
-                event_title = evt.get("title", ticker)
-                event_date = evt.get("date", "")[:10]
-                break
-        if audio_url:
-            break
-
-    if not audio_url:
-        return None
-
-    print(f"    Audio found: {audio_url[:80]}... transcribing via Whisper...")
-
-    # Download audio (25 MB cap — Whisper limit is 25 MB)
-    try:
-        raw = _fetch_limited(audio_url, max_bytes=25 * 1024 * 1024)
-        if not raw or len(raw) < 10_000:
-            return None
-    except Exception:
-        return None
-
-    # Determine file extension from URL or default to mp3
-    ext = re.search(r"\.(mp3|mp4|m4a|wav|webm|ogg)(\?|$)", audio_url, re.IGNORECASE)
-    ext = ext.group(1) if ext else "mp3"
-
-    # Write to a temp file and send to Whisper
-    import tempfile
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return None
-
-    try:
-        client = OpenAI(api_key=openai_key)
-        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            whisper_resp = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="text",
-            )
-        os.unlink(tmp_path)
-
-        text = whisper_resp if isinstance(whisper_resp, str) else str(whisper_resp)
-        return (
-            f"# Earnings Call Transcript — {event_title} ({event_date})\n"
-            f"Source: Quartr audio → Whisper transcription\n\n{text}"
-        )
-    except Exception as e:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        print(f"    Whisper transcription failed: {e}")
-        return None
-
-
-def _transcript_from_web(ticker: str, company_name: str) -> str | None:
-    """Search for a transcript via DuckDuckGo."""
-    queries = [
-        f"{ticker} {company_name} earnings call transcript full text 2025",
-        f"{ticker} earnings call transcript Q4 2024 site:seekingalpha.com OR site:fool.com",
-    ]
-    results = []
-    for q in queries:
-        r = web_search(q, max_results=4)
-        if r and "Search failed" not in r:
-            results.append(r)
-    if not results:
-        return None
-    text = "\n\n".join(results)
-    return (
-        f"# Earnings Call — {ticker} (web search excerpts)\n"
-        f"Source: DuckDuckGo\n\n{text}"
-    )
-
-
-def gather_transcript(ticker: str, company_name: str) -> str:
-    """Fetch earnings call transcript with automatic fallback chain:
-    1. Quartr API (richest — named speakers, full text)
-    2. SEC EDGAR 8-K exhibit (some companies file transcripts)
-    3. DuckDuckGo web search (summary excerpts)
-    """
-    print(f"  Fetching transcript: trying Quartr...")
-    result = _transcript_from_quartr(ticker)
-    if result:
-        print(f"    Quartr: OK")
-        if len(result) > MAX_CHARS_TRANSCRIPT:
-            result = result[:MAX_CHARS_TRANSCRIPT] + "\n\n[... truncated ...]"
-        return result
-
-    print(f"    Quartr: unavailable — trying SEC EDGAR transcript exhibit...")
-    result = _transcript_from_sec_exhibit(ticker)
-    if result:
-        print(f"    SEC exhibit: OK")
-        if len(result) > MAX_CHARS_TRANSCRIPT:
-            result = result[:MAX_CHARS_TRANSCRIPT] + "\n\n[... truncated ...]"
-        return result
-
-    print(f"    SEC exhibit: not found — trying Quartr audio + Whisper transcription...")
-    result = _transcript_from_audio(ticker)
-    if result:
-        print(f"    Whisper: OK")
-        if len(result) > MAX_CHARS_TRANSCRIPT:
-            result = result[:MAX_CHARS_TRANSCRIPT] + "\n\n[... truncated ...]"
-        return result
-
-    print(f"    Whisper: unavailable — falling back to web search...")
-    result = _transcript_from_web(ticker, company_name)
-    if result:
-        print(f"    Web search: OK")
-        if len(result) > MAX_CHARS_TRANSCRIPT:
-            result = result[:MAX_CHARS_TRANSCRIPT] + "\n\n[... truncated ...]"
-        return result
-
-    return f"No transcript found for {ticker} (Quartr unavailable, no SEC exhibit, no audio, web search empty)."
-
-
-# ── File parsing ───────────────────────────────────────────────────────────────
-
-def parse_pdf(file_path: str) -> str:
-    try:
-        text_parts = []
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    text_parts.append(text)
-        full_text = "\n\n".join(text_parts).strip()
-        if len(full_text) > MAX_CHARS_FILE:
-            full_text = full_text[:MAX_CHARS_FILE] + "\n\n[... truncated ...]"
-        return full_text
-    except Exception as e:
-        return f"[PDF extraction failed: {e}]"
-
-
-def parse_excel(file_path: str) -> str:
-    try:
-        ext = Path(file_path).suffix.lower()
-        if ext == ".csv":
-            df = pd.read_csv(file_path)
-            result = df.to_string(max_rows=100)
-        else:
-            xl = pd.ExcelFile(file_path)
-            parts = []
-            for sheet in xl.sheet_names[:5]:
-                df = xl.parse(sheet)
-                parts.append(f"### Sheet: {sheet}\n{df.to_string(max_rows=80, max_cols=20)}")
-            result = "\n\n".join(parts)
-        if len(result) > MAX_CHARS_FILE:
-            result = result[:MAX_CHARS_FILE] + "\n\n[... truncated ...]"
-        return result
-    except Exception as e:
-        return f"[Excel/CSV extraction failed: {e}]"
-
-
-def parse_uploaded_files(file_paths: list, captions: dict = None) -> str:
-    if not file_paths:
-        return ""
-    captions = captions or {}
-    parts = []
-    for fp in file_paths:
-        if not os.path.exists(fp):
-            continue
-        ext = Path(fp).suffix.lower()
-        name = Path(fp).name
-        if ext == ".pdf":
-            content = parse_pdf(fp)
-        elif ext in (".xlsx", ".xls", ".csv"):
-            content = parse_excel(fp)
-        else:
-            content = f"[Unsupported file type: {ext}]"
-        header = f"## Uploaded File: {name}"
-        if fp in captions and captions[fp]:
-            header += f"\nUser context: {captions[fp]}"
-        parts.append(f"{header}\n{content}")
-    return "\n\n".join(parts)
-
-
-# ── Telegram digest search ──────────────────────────────────────────────────────
-
-TELEGRAM_API_ID   = 33919151
-TELEGRAM_API_HASH = "dd0a935bd6545cf56910292ff4445c4e"
-MAX_CHARS_TELEGRAM = 12000
-
-
-async def _fetch_telegram_messages(group_name: str, search_query: str, days: int, max_messages: int) -> str:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from datetime import datetime, timedelta, timezone
-
-    session_str = os.environ.get("TELEGRAM_SESSION", "")
-    if not session_str:
-        return "TELEGRAM_SESSION not set."
-
-    session = StringSession(session_str) if len(session_str) > 20 else session_str
-    tg = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-
-    try:
-        await tg.connect()
-        if not await tg.is_user_authorized():
-            return "Telegram session not authorized."
-
-        dialogs = await tg.get_dialogs()
-        group_entity = None
-        for d in dialogs:
-            if d.name == group_name:
-                group_entity = d.entity
-                break
-
-        if group_entity is None:
-            return f"Group '{group_name}' not found."
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        messages = []
-
-        async for msg in tg.iter_messages(group_entity, search=search_query, limit=max_messages):
-            if msg.date < cutoff:
-                break
-            if msg.text and msg.text.strip():
-                messages.append(f"[{msg.date.strftime('%Y-%m-%d')}] {msg.text.strip()}")
-
-        if not messages:
-            return f"No messages found for '{search_query}' in '{group_name}' (last {days} days)."
-
-        result = f"## {group_name} — '{search_query}' ({len(messages)} messages, last {days} days)\n\n"
-        result += "\n\n---\n\n".join(messages)
-        if len(result) > MAX_CHARS_TELEGRAM:
-            result = result[:MAX_CHARS_TELEGRAM] + "\n\n[... truncated ...]"
-        return result
-
-    finally:
-        await tg.disconnect()
-
-
-def gather_telegram_digest(group_name: str, search_query: str, days: int, max_messages: int = 200) -> str:
-    """Fetch relevant messages from a Telegram digest group. Safe to call from a thread executor."""
-    import asyncio
-    try:
-        return asyncio.run(_fetch_telegram_messages(group_name, search_query, days, max_messages))
-    except Exception as e:
-        return f"Telegram digest fetch failed: {e}"
-
-
-# ── Main entry point ───────────────────────────────────────────────────────────
-
-def gather_all(ticker: str, staged_files: list, staged_captions: dict = None) -> dict:
-    """
-    Gather all data for a ticker. Returns a dict with keys:
-    yfinance, news, sec, transcript, uploaded_files, telegram_digest, company_name
-    """
-    print(f"  Gathering yfinance data for {ticker}...")
-    yf_data = gather_yfinance(ticker)
-
-    company_name = ticker
-    try:
-        info = yf.Ticker(ticker).info
-        company_name = info.get("longName", ticker)
-    except Exception:
-        pass
-
-    print(f"  Searching news for {company_name}...")
-    news_data = gather_news(ticker, company_name)
-
-    print(f"  Downloading SEC EDGAR filings (8-K press release, 10-Q, 10-K)...")
-    sec_data = gather_sec(ticker)
-
-    print(f"  Fetching earnings transcript...")
-    transcript_data = gather_transcript(ticker, company_name)
-
-    print(f"  Searching Stock Digest (Telegram) for {ticker} / {company_name} — last 12 months...")
-    tg_ticker = gather_telegram_digest("📈 Stock Digest", ticker, days=365, max_messages=200)
-    tg_name   = gather_telegram_digest("📈 Stock Digest", company_name, days=365, max_messages=100) \
-                if company_name != ticker else ""
-    telegram_data = tg_ticker
-    if tg_name and "No messages found" not in tg_name:
-        telegram_data += "\n\n" + tg_name
-
-    print(f"  Parsing {len(staged_files)} staged file(s)...")
-    uploaded = parse_uploaded_files(staged_files, staged_captions)
-
-    return {
-        "ticker": ticker,
-        "company_name": company_name,
-        "yfinance": yf_data,
-        "news": news_data,
-        "sec": sec_data,
-        "transcript": transcript_data,
-        "telegram_digest": telegram_data,
-        "uploaded_files": uploaded,
-    }
-
-================================================================================
-FILE: C:/Users/kangw/ramp-bot/gather_macro.py
-================================================================================
-"""
-Data gathering for macro ramp.
-Pulls: yfinance price + technicals, asset-type-specific web search,
-and user-uploaded PDFs/Excels. No SEC EDGAR or earnings transcripts.
-"""
-
-import os
-import re
-import pandas as pd
-import yfinance as yf
-from pathlib import Path
-
-try:
-    import pdfplumber
-    HAS_PDFPLUMBER = True
-except ImportError:
-    HAS_PDFPLUMBER = False
-
-MAX_CHARS_PRICE    = 6000
-MAX_CHARS_NEWS     = 10000
-MAX_CHARS_FILE     = 8000
-MAX_CHARS_TELEGRAM = 12000
-
-TELEGRAM_API_ID   = 33919151
-TELEGRAM_API_HASH = "dd0a935bd6545cf56910292ff4445c4e"
-
-# ── Asset registry ──────────────────────────────────────────────────────────────
-
-ASSET_MAP = {
-    # ── Precious Metals ──────────────────────────────────────────────────────────
-    "GOLD": "GC=F",       "XAU": "GC=F",
-    "SILVER": "SI=F",     "XAG": "SI=F",
-    "PLATINUM": "PL=F",   "PLAT": "PL=F",   "XPT": "PL=F",
-    "PALLADIUM": "PA=F",  "PALL": "PA=F",   "XPD": "PA=F",
-    "GLD": "GLD",         "SLV": "SLV",
-    "GDX": "GDX",         "GDXJ": "GDXJ",
-
-    # ── Energy ───────────────────────────────────────────────────────────────────
-    "WTI": "CL=F",        "OIL": "CL=F",    "CRUDE": "CL=F",
-    "BRENT": "BZ=F",      "BRENTOIL": "BZ=F",
-    "NATGAS": "NG=F",     "GAS": "NG=F",    "NG": "NG=F",
-    "RBOB": "RB=F",       "GASOLINE": "RB=F",
-    "HEATINGOIL": "HO=F", "HO": "HO=F",
-    "USO": "USO",         "UNG": "UNG",
-
-    # ── Base Metals ──────────────────────────────────────────────────────────────
-    "COPPER": "HG=F",     "HG": "HG=F",
-    "ALUMINUM": "ALI=F",  "ALUMINIUM": "ALI=F",
-    "ZINC": "^ZINC",
-    "NICKEL": "^NICKEL",
-
-    # ── Agricultural ─────────────────────────────────────────────────────────────
-    "WHEAT": "ZW=F",
-    "CORN": "ZC=F",
-    "SOYBEAN": "ZS=F",    "SOY": "ZS=F",
-    "SOYMEAL": "ZM=F",
-    "SOYOIL": "ZL=F",
-    "COFFEE": "KC=F",
-    "SUGAR": "SB=F",
-    "COCOA": "CC=F",
-    "COTTON": "CT=F",
-    "LIVECATTLE": "LE=F", "CATTLE": "LE=F",
-    "LEANHOGS": "HE=F",   "HOGS": "HE=F",
-    "LUMBER": "LBR=F",
-    "OJ": "OJ=F",         "ORANGEJUICE": "OJ=F",
-    "DBA": "DBA",
-
-    # ── US Rates ─────────────────────────────────────────────────────────────────
-    "US2Y": "^IRX",       "2Y": "^IRX",     "TBILL": "^IRX",
-    "US5Y": "^FVX",       "5Y": "^FVX",
-    "US10Y": "^TNX",      "10Y": "^TNX",    "TNX": "^TNX",
-    "US30Y": "^TYX",      "30Y": "^TYX",    "TYX": "^TYX",
-    "TLT": "TLT",         "IEF": "IEF",     "SHY": "SHY",
-    "TBT": "TBT",         "TMF": "TMF",     "TMV": "TMV",
-    "HYG": "HYG",         "JNK": "JNK",
-    "LQD": "LQD",         "EMB": "EMB",
-    "TIPS": "TIP",        "TIP": "TIP",
-
-    # ── Global Rates / Bonds ─────────────────────────────────────────────────────
-    "GILT": "^TNX",       "UK10Y": "^TNX",   # closest proxy — use directly for now
-    "BUND": "^DE10YB-EUR", "GERMAN10Y": "^DE10YB-EUR",
-    "JGB": "^JP10YB-JPN",  "JAPAN10Y": "^JP10YB-JPN",
-
-    # ── G10 FX ───────────────────────────────────────────────────────────────────
-    "EURUSD": "EURUSD=X",  "EUR": "EURUSD=X",
-    "USDJPY": "JPY=X",     "JPY": "JPY=X",
-    "GBPUSD": "GBPUSD=X",  "GBP": "GBPUSD=X",  "CABLE": "GBPUSD=X",
-    "AUDUSD": "AUDUSD=X",  "AUD": "AUDUSD=X",  "AUSSIE": "AUDUSD=X",
-    "NZDUSD": "NZDUSD=X",  "NZD": "NZDUSD=X",  "KIWI": "NZDUSD=X",
-    "USDCAD": "CAD=X",     "CAD": "CAD=X",     "LOONIE": "CAD=X",
-    "USDCHF": "CHF=X",     "CHF": "CHF=X",     "SWISSY": "CHF=X",
-    "DXY": "DX-Y.NYB",     "DOLLAR": "DX-Y.NYB", "USD": "DX-Y.NYB",
-    "UUP": "UUP",
-
-    # ── Cross Rates ──────────────────────────────────────────────────────────────
-    "EURJPY": "EURJPY=X",
-    "EURGBP": "EURGBP=X",
-    "GBPJPY": "GBPJPY=X",
-    "AUDJPY": "AUDJPY=X",
-    "EURAUD": "EURAUD=X",
-    "EURCHF": "EURCHF=X",
-    "GBPAUD": "GBPAUD=X",
-
-    # ── EM FX ────────────────────────────────────────────────────────────────────
-    "USDCNY": "CNY=X",    "CNY": "CNY=X",   "YUAN": "CNY=X",
-    "USDCNH": "CNH=X",    "CNH": "CNH=X",
-    "USDINR": "INR=X",    "INR": "INR=X",   "RUPEE": "INR=X",
-    "USDBRL": "BRL=X",    "BRL": "BRL=X",   "REAL": "BRL=X",
-    "USDMXN": "MXN=X",    "MXN": "MXN=X",   "PESO": "MXN=X",
-    "USDZAR": "ZAR=X",    "ZAR": "ZAR=X",   "RAND": "ZAR=X",
-    "USDTRY": "TRY=X",    "TRY": "TRY=X",   "LIRA": "TRY=X",
-    "USDKRW": "KRW=X",    "KRW": "KRW=X",   "WON": "KRW=X",
-    "USDSGD": "SGD=X",    "SGD": "SGD=X",
-    "USDHKD": "HKD=X",    "HKD": "HKD=X",
-    "USDTHB": "THB=X",    "THB": "THB=X",
-    "USDIDR": "IDR=X",    "IDR": "IDR=X",
-    "USDPLN": "PLN=X",    "PLN": "PLN=X",
-    "USDSEK": "SEK=X",    "SEK": "SEK=X",
-    "USDNOK": "NOK=X",    "NOK": "NOK=X",
-
-    # ── US Equity Indexes ────────────────────────────────────────────────────────
-    "SPX": "^GSPC",       "SP500": "^GSPC",  "ES": "^GSPC",
-    "NDX": "^NDX",        "NASDAQ": "^NDX",  "NQ": "^NDX",
-    "DOW": "^DJI",        "DJIA": "^DJI",
-    "RTY": "^RUT",        "RUSSELL": "^RUT", "RUSSELL2000": "^RUT",
-    "VIX": "^VIX",
-    "SPY": "SPY",         "QQQ": "QQQ",      "IWM": "IWM",
-    "DIA": "DIA",
-
-    # ── European Indexes ─────────────────────────────────────────────────────────
-    "FTSE": "^FTSE",      "FTSE100": "^FTSE", "UKX": "^FTSE",
-    "DAX": "^GDAXI",      "DAX40": "^GDAXI",
-    "CAC": "^FCHI",       "CAC40": "^FCHI",
-    "IBEX": "^IBEX",      "IBEX35": "^IBEX",
-    "SMI": "^SSMI",
-    "AEX": "^AEX",
-    "MIB": "FTSEMIB.MI",  "FTMIB": "FTSEMIB.MI",
-    "STOXX50": "^STOXX50E", "EUROSTOXX": "^STOXX50E",
-    "VSTOXX": "^V2TX",    "VSTOX": "^V2TX",
-
-    # ── Asia-Pacific Indexes ─────────────────────────────────────────────────────
-    "NIKKEI": "^N225",    "NKY": "^N225",    "N225": "^N225",
-    "TOPIX": "^TOPX",
-    "HSI": "^HSI",        "HANGSENG": "^HSI",
-    "CSI300": "000300.SS", "A50": "000300.SS",
-    "KOSPI": "^KS11",     "KS11": "^KS11",
-    "ASX200": "^AXJO",    "ASX": "^AXJO",
-    "SENSEX": "^BSESN",   "NIFTY": "^NSEI",  "NIFTY50": "^NSEI",
-    "TWSE": "^TWII",      "TAIWAN": "^TWII",
-    "STI": "^STI",        "SINGAPORE": "^STI",
-
-    # ── EM / Other Indexes ───────────────────────────────────────────────────────
-    "BOVESPA": "^BVSP",   "IBOV": "^BVSP",   "BRAZIL": "^BVSP",
-    "MEXBOL": "^MXX",     "MEXICO": "^MXX",
-    "EEM": "EEM",         "VWO": "VWO",       "EWZ": "EWZ",
-
-    # ── Crypto ───────────────────────────────────────────────────────────────────
-    "BTC": "BTC-USD",     "BITCOIN": "BTC-USD",
-    "ETH": "ETH-USD",     "ETHEREUM": "ETH-USD",
-    "SOL": "SOL-USD",     "SOLANA": "SOL-USD",
-    "XRP": "XRP-USD",
-    "IBIT": "IBIT",       "FBTC": "FBTC",
-}
-
-ASSET_TYPES = {
-    "commodity": {
-        "GC=F", "SI=F", "PL=F", "PA=F", "GLD", "SLV", "GDX", "GDXJ",
-        "CL=F", "BZ=F", "NG=F", "RB=F", "HO=F", "USO", "UNG",
-        "HG=F", "ALI=F", "^ZINC", "^NICKEL",
-        "ZW=F", "ZC=F", "ZS=F", "ZM=F", "ZL=F", "KC=F", "SB=F",
-        "CC=F", "CT=F", "LE=F", "HE=F", "LBR=F", "OJ=F", "DBA",
-    },
-    "rates": {
-        "^IRX", "^FVX", "^TNX", "^TYX",
-        "TLT", "IEF", "SHY", "TBT", "TMF", "TMV",
-        "HYG", "JNK", "LQD", "EMB", "TIP",
-        "^DE10YB-EUR", "^JP10YB-JPN",
-    },
-    "fx": {
-        "EURUSD=X", "JPY=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X",
-        "CAD=X", "CHF=X", "DX-Y.NYB", "UUP",
-        "EURJPY=X", "EURGBP=X", "GBPJPY=X", "AUDJPY=X", "EURAUD=X",
-        "EURCHF=X", "GBPAUD=X",
-        "CNY=X", "CNH=X", "INR=X", "BRL=X", "MXN=X", "ZAR=X",
-        "TRY=X", "KRW=X", "SGD=X", "HKD=X", "THB=X", "IDR=X",
-        "PLN=X", "SEK=X", "NOK=X",
-    },
-    "equity": {
-        "^GSPC", "^NDX", "^DJI", "^RUT", "^VIX",
-        "SPY", "QQQ", "IWM", "DIA",
-        "^FTSE", "^GDAXI", "^FCHI", "^IBEX", "^SSMI", "^AEX",
-        "FTSEMIB.MI", "^STOXX50E", "^V2TX",
-        "^N225", "^TOPX", "^HSI", "000300.SS", "^KS11", "^AXJO",
-        "^BSESN", "^NSEI", "^TWII", "^STI",
-        "^BVSP", "^MXX", "EEM", "VWO", "EWZ",
-    },
-    "crypto": {
-        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "IBIT", "FBTC",
-    },
-}
-
-ASSET_DISPLAY_NAMES = {
-    # Precious metals
-    "GC=F": "Gold", "SI=F": "Silver", "PL=F": "Platinum", "PA=F": "Palladium",
-    "GLD": "SPDR Gold ETF", "SLV": "iShares Silver ETF",
-    "GDX": "VanEck Gold Miners ETF", "GDXJ": "VanEck Junior Gold Miners ETF",
-    # Energy
-    "CL=F": "WTI Crude Oil", "BZ=F": "Brent Crude",
-    "NG=F": "Natural Gas", "RB=F": "RBOB Gasoline", "HO=F": "Heating Oil",
-    "USO": "United States Oil ETF", "UNG": "United States Natural Gas ETF",
-    # Base metals
-    "HG=F": "Copper", "ALI=F": "Aluminum", "^ZINC": "Zinc", "^NICKEL": "Nickel",
-    # Agricultural
-    "ZW=F": "Wheat", "ZC=F": "Corn", "ZS=F": "Soybean", "ZM=F": "Soybean Meal",
-    "ZL=F": "Soybean Oil", "KC=F": "Coffee", "SB=F": "Sugar", "CC=F": "Cocoa",
-    "CT=F": "Cotton", "LE=F": "Live Cattle", "HE=F": "Lean Hogs",
-    "LBR=F": "Lumber", "OJ=F": "Orange Juice", "DBA": "Invesco Agri ETF",
-    # US Rates
-    "^IRX": "US 2Y Treasury Yield", "^FVX": "US 5Y Treasury Yield",
-    "^TNX": "US 10Y Treasury Yield", "^TYX": "US 30Y Treasury Yield",
-    "TLT": "iShares 20Y+ Treasury ETF", "IEF": "iShares 7-10Y Treasury ETF",
-    "SHY": "iShares 1-3Y Treasury ETF", "TBT": "ProShares Short 20Y Treasury",
-    "TMF": "Direxion 3x Long Treasury", "TMV": "Direxion 3x Short Treasury",
-    "HYG": "iShares HY Bond ETF", "JNK": "SPDR HY Bond ETF",
-    "LQD": "iShares IG Bond ETF", "EMB": "iShares EM Bond ETF", "TIP": "iShares TIPS ETF",
-    # Global Rates
-    "^DE10YB-EUR": "Germany 10Y Bund Yield", "^JP10YB-JPN": "Japan 10Y JGB Yield",
-    # G10 FX
-    "EURUSD=X": "EUR/USD", "JPY=X": "USD/JPY", "GBPUSD=X": "GBP/USD",
-    "AUDUSD=X": "AUD/USD", "NZDUSD=X": "NZD/USD", "CAD=X": "USD/CAD",
-    "CHF=X": "USD/CHF", "DX-Y.NYB": "DXY (Dollar Index)", "UUP": "Invesco Dollar ETF",
-    # Cross rates
-    "EURJPY=X": "EUR/JPY", "EURGBP=X": "EUR/GBP", "GBPJPY=X": "GBP/JPY",
-    "AUDJPY=X": "AUD/JPY", "EURAUD=X": "EUR/AUD", "EURCHF=X": "EUR/CHF",
-    "GBPAUD=X": "GBP/AUD",
-    # EM FX
-    "CNY=X": "USD/CNY", "CNH=X": "USD/CNH", "INR=X": "USD/INR",
-    "BRL=X": "USD/BRL", "MXN=X": "USD/MXN", "ZAR=X": "USD/ZAR",
-    "TRY=X": "USD/TRY", "KRW=X": "USD/KRW", "SGD=X": "USD/SGD",
-    "HKD=X": "USD/HKD", "THB=X": "USD/THB", "IDR=X": "USD/IDR",
-    "PLN=X": "USD/PLN", "SEK=X": "USD/SEK", "NOK=X": "USD/NOK",
-    # US Equity
-    "^GSPC": "S&P 500", "^NDX": "Nasdaq 100", "^DJI": "Dow Jones",
-    "^RUT": "Russell 2000", "^VIX": "VIX",
-    "SPY": "SPDR S&P 500 ETF", "QQQ": "Invesco QQQ ETF",
-    "IWM": "iShares Russell 2000 ETF", "DIA": "SPDR Dow Jones ETF",
-    # European Indexes
-    "^FTSE": "FTSE 100", "^GDAXI": "DAX", "^FCHI": "CAC 40",
-    "^IBEX": "IBEX 35", "^SSMI": "SMI", "^AEX": "AEX",
-    "FTSEMIB.MI": "FTSE MIB", "^STOXX50E": "Euro Stoxx 50", "^V2TX": "VSTOXX",
-    # Asia-Pacific Indexes
-    "^N225": "Nikkei 225", "^TOPX": "TOPIX", "^HSI": "Hang Seng",
-    "000300.SS": "CSI 300", "^KS11": "KOSPI", "^AXJO": "ASX 200",
-    "^BSESN": "BSE Sensex", "^NSEI": "Nifty 50", "^TWII": "TWSE",
-    "^STI": "Straits Times Index",
-    # EM / Other Indexes
-    "^BVSP": "Bovespa", "^MXX": "IPC Mexico",
-    "EEM": "iShares MSCI EM ETF", "VWO": "Vanguard FTSE EM ETF",
-    "EWZ": "iShares MSCI Brazil ETF",
-    # Crypto
-    "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "SOL-USD": "Solana",
-    "XRP-USD": "XRP", "IBIT": "iShares Bitcoin ETF", "FBTC": "Fidelity Bitcoin ETF",
-}
-
-
-def resolve_asset(name: str) -> tuple[str, str, str]:
-    """Return (yf_ticker, display_name, asset_type) for a given input name."""
-    key = name.upper().replace("/", "").replace("-", "").replace(".", "")
-    yf_ticker = ASSET_MAP.get(key, name)
-    display_name = ASSET_DISPLAY_NAMES.get(yf_ticker, yf_ticker)
-    asset_type = "unknown"
-    for atype, tickers in ASSET_TYPES.items():
-        if yf_ticker in tickers:
-            asset_type = atype
-            break
-    return yf_ticker, display_name, asset_type
-
-
-# ── Web search ──────────────────────────────────────────────────────────────────
-
-def web_search(query: str, max_results: int = 6) -> str:
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        if not results:
-            return "No results found."
-        return "\n\n".join(
-            f"**{r['title']}**\n{r['href']}\n{r['body']}" for r in results
-        )
-    except Exception as e:
-        return f"Search failed: {e}"
-
-
-def gather_news(display_name: str, asset_type: str) -> str:
-    if asset_type == "commodity":
-        queries = [
-            f"{display_name} price outlook supply demand 2025",
-            f"{display_name} inventory stockpiles COT CFTC positioning",
-            f"{display_name} macro drivers central bank geopolitical",
-            f"{display_name} technical analysis support resistance analyst target",
-        ]
-    elif asset_type == "rates":
-        queries = [
-            f"{display_name} yield outlook Federal Reserve ECB policy 2025",
-            f"{display_name} inflation expectations real yield breakeven",
-            f"{display_name} Treasury supply foreign demand COT positioning",
-            f"{display_name} technical levels support resistance analyst forecast",
-        ]
-    elif asset_type == "fx":
-        queries = [
-            f"{display_name} rate differential central bank outlook 2025",
-            f"{display_name} COT IMM speculative positioning net long short",
-            f"{display_name} technical analysis support resistance levels",
-            f"{display_name} PPP fair value current account inflation differential",
-        ]
-    elif asset_type == "equity":
-        queries = [
-            f"{display_name} index outlook earnings valuation 2025",
-            f"{display_name} COT positioning put call ratio sentiment",
-            f"{display_name} technical analysis support resistance",
-            f"{display_name} macro risks Fed liquidity earnings recession",
-        ]
-    elif asset_type == "crypto":
-        queries = [
-            f"{display_name} price outlook on-chain data 2025",
-            f"{display_name} institutional flows ETF inflows positioning",
-            f"{display_name} technical analysis support resistance levels",
-            f"{display_name} macro correlation risk-on risk-off Fed liquidity",
-        ]
-    else:
-        queries = [
-            f"{display_name} price outlook 2025",
-            f"{display_name} positioning sentiment COT",
-            f"{display_name} technical analysis levels",
-            f"{display_name} macro drivers risks",
-        ]
-
-    parts = []
-    for q in queries:
-        result = web_search(q, max_results=5)
-        parts.append(f"### Search: {q}\n{result}")
-    full = "\n\n".join(parts)
-    if len(full) > MAX_CHARS_NEWS:
-        full = full[:MAX_CHARS_NEWS] + "\n\n[... truncated ...]"
-    return full
-
-
-# ── Price data + technicals ─────────────────────────────────────────────────────
-
-def gather_price_data(yf_ticker: str, display_name: str) -> str:
-    t = yf.Ticker(yf_ticker)
-    parts = [f"## {display_name} ({yf_ticker}) — Price & Technicals"]
-
-    try:
-        hist = t.history(period="2y")
-        if hist.empty:
-            return f"No price data available for {yf_ticker}."
-
-        close = hist["Close"].dropna()
-        high_series = hist["High"].dropna()
-        low_series = hist["Low"].dropna()
-        current = close.iloc[-1]
-
-        # Moving averages
-        ma14  = close.rolling(14).mean().iloc[-1]
-        ma50  = close.rolling(50).mean().iloc[-1]
-        ma200 = close.rolling(200).mean().iloc[-1]
-
-        # RSI(14)
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta).clip(lower=0).rolling(14).mean()
-        rsi = (100 - 100 / (1 + gain / loss)).iloc[-1]
-
-        # ATR(20)
-        prev_close = close.shift(1)
-        tr = pd.concat([
-            high_series - low_series,
-            (high_series - prev_close).abs(),
-            (low_series - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        atr20 = tr.rolling(20).mean().iloc[-1]
-
-        # 52-week range
-        high52 = close.rolling(252).max().iloc[-1]
-        low52  = close.rolling(252).min().iloc[-1]
-        pct_from_high = (current / high52 - 1) * 100
-        pct_from_low  = (current / low52  - 1) * 100
-
-        # YTD
-        ytd_start = close[close.index.year == close.index[-1].year].iloc[0]
-        ytd_change = (current / ytd_start - 1) * 100
-
-        # 1M, 3M, 6M, 1Y returns
-        def ret(n_days):
-            if len(close) > n_days:
-                return (current / close.iloc[-n_days] - 1) * 100
-            return None
-
-        parts.append(f"\n### Current Price: {current:.4f}")
-        parts.append(
-            f"52W High: {high52:.4f} ({pct_from_high:+.1f}% from high)\n"
-            f"52W Low:  {low52:.4f} ({pct_from_low:+.1f}% from low)\n"
-            f"YTD: {ytd_change:+.1f}%\n"
-            f"1M: {ret(21):+.1f}%  |  3M: {ret(63):+.1f}%  |  6M: {ret(126):+.1f}%  |  1Y: {ret(252):+.1f}%"
-        )
-
-        parts.append(
-            f"\n### Moving Averages\n"
-            f"14d MA:  {ma14:.4f}  ({'ABOVE' if current > ma14 else 'BELOW'})\n"
-            f"50d MA:  {ma50:.4f}  ({'ABOVE' if current > ma50 else 'BELOW'})\n"
-            f"200d MA: {ma200:.4f} ({'ABOVE' if current > ma200 else 'BELOW'})"
-        )
-
-        ma_alignment = "Bullish (14>50>200)" if ma14 > ma50 > ma200 else \
-                       "Bearish (14<50<200)" if ma14 < ma50 < ma200 else "Mixed"
-        parts.append(f"MA Alignment: {ma_alignment}")
-
-        parts.append(
-            f"\n### Momentum\n"
-            f"RSI(14): {rsi:.1f}  "
-            f"({'Overbought >70' if rsi > 70 else 'Oversold <30' if rsi < 30 else 'Neutral'})\n"
-            f"ATR(20): {atr20:.4f} ({(atr20/current)*100:.2f}% of price)"
-        )
-
-        # Recent weekly closes
-        weekly = close.resample("W").last().tail(26)
-        parts.append(f"\n### Weekly Closes (last 26 weeks)\n{weekly.to_string()}")
-
-    except Exception as e:
-        parts.append(f"Price data error: {e}")
-
-    result = "\n".join(parts)
-    if len(result) > MAX_CHARS_PRICE:
-        result = result[:MAX_CHARS_PRICE] + "\n\n[... truncated ...]"
-    return result
-
-
-# ── File parsing ────────────────────────────────────────────────────────────────
-
-def parse_pdf(file_path: str) -> str:
-    if not HAS_PDFPLUMBER:
-        return "[pdfplumber not installed — PDF parsing unavailable]"
-    try:
-        text_parts = []
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    text_parts.append(text)
-        full_text = "\n\n".join(text_parts).strip()
-        if len(full_text) > MAX_CHARS_FILE:
-            full_text = full_text[:MAX_CHARS_FILE] + "\n\n[... truncated ...]"
-        return full_text
-    except Exception as e:
-        return f"[PDF extraction failed: {e}]"
-
-
-def parse_excel(file_path: str) -> str:
-    try:
-        ext = Path(file_path).suffix.lower()
-        if ext == ".csv":
-            df = pd.read_csv(file_path)
-            result = df.to_string(max_rows=100)
-        else:
-            xl = pd.ExcelFile(file_path)
-            parts = []
-            for sheet in xl.sheet_names[:5]:
-                df = xl.parse(sheet)
-                parts.append(f"### Sheet: {sheet}\n{df.to_string(max_rows=80, max_cols=20)}")
-            result = "\n\n".join(parts)
-        if len(result) > MAX_CHARS_FILE:
-            result = result[:MAX_CHARS_FILE] + "\n\n[... truncated ...]"
-        return result
-    except Exception as e:
-        return f"[Excel/CSV extraction failed: {e}]"
-
-
-def parse_uploaded_files(file_paths: list, captions: dict = None) -> str:
-    if not file_paths:
-        return ""
-    captions = captions or {}
-    parts = []
-    for fp in file_paths:
-        if not os.path.exists(fp):
-            continue
-        ext = Path(fp).suffix.lower()
-        name = Path(fp).name
-        if ext == ".pdf":
-            content = parse_pdf(fp)
-        elif ext in (".xlsx", ".xls", ".csv"):
-            content = parse_excel(fp)
-        else:
-            content = f"[Unsupported file type: {ext}]"
-        header = f"## Uploaded File: {name}"
-        if fp in captions and captions[fp]:
-            header += f"\nUser context: {captions[fp]}"
-        parts.append(f"{header}\n{content}")
-    return "\n\n".join(parts)
-
-
-# ── Telegram digest ─────────────────────────────────────────────────────────────
-
-async def _fetch_telegram_messages(group_name: str, search_query: str, days: int, max_messages: int) -> str:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from datetime import datetime, timedelta, timezone
-    session_str = os.environ.get("TELEGRAM_SESSION", "")
-    session = StringSession(session_str) if len(session_str) > 20 else session_str
-    tg = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-    try:
-        await tg.connect()
-        if not await tg.is_user_authorized():
-            return "Telegram session not authorized."
-        dialogs = await tg.get_dialogs()
-        group_entity = None
-        for d in dialogs:
-            if d.name == group_name:
-                group_entity = d.entity
-                break
-        if group_entity is None:
-            return f"Group '{group_name}' not found."
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        messages = []
-        async for msg in tg.iter_messages(group_entity, search=search_query, limit=max_messages):
-            if msg.date < cutoff:
-                break
-            if msg.text and msg.text.strip():
-                messages.append(f"[{msg.date.strftime('%Y-%m-%d')}] {msg.text.strip()}")
-        if not messages:
-            return f"No messages found for '{search_query}' in '{group_name}' (last {days} days)."
-        result = f"## {group_name} — '{search_query}' ({len(messages)} messages, last {days} days)\n\n"
-        result += "\n\n---\n\n".join(messages)
-        if len(result) > MAX_CHARS_TELEGRAM:
-            result = result[:MAX_CHARS_TELEGRAM] + "\n\n[... truncated ...]"
-        return result
-    finally:
-        await tg.disconnect()
-
-
-def gather_telegram_digest(group_name: str, search_query: str, days: int, max_messages: int = 50) -> str:
-    import asyncio
-    try:
-        return asyncio.run(_fetch_telegram_messages(group_name, search_query, days, max_messages))
-    except Exception as e:
-        return f"Telegram digest fetch failed: {e}"
-
-
-# ── Main entry point ────────────────────────────────────────────────────────────
-
-def gather_all(asset_input: str, staged_files: list, staged_captions: dict = None) -> dict:
-    """
-    Gather all data for a macro asset. Returns dict with keys:
-    yf_ticker, display_name, asset_type, price_data, news, uploaded_files
-    """
-    yf_ticker, display_name, asset_type = resolve_asset(asset_input)
-
-    print(f"  Asset: {display_name} ({yf_ticker}) | Type: {asset_type}")
-
-    print(f"  Gathering price data + technicals...")
-    price_data = gather_price_data(yf_ticker, display_name)
-
-    print(f"  Searching macro news and context...")
-    news_data = gather_news(display_name, asset_type)
-
-    print(f"  Parsing {len(staged_files)} staged file(s)...")
-    uploaded = parse_uploaded_files(staged_files, staged_captions)
-
-    print(f"  Searching News Digest Telegram group...")
-    telegram_data = gather_telegram_digest("📊 News Digest", display_name, days=30, max_messages=50)
-
-    return {
-        "asset_input":    asset_input,
-        "yf_ticker":      yf_ticker,
-        "display_name":   display_name,
-        "asset_type":     asset_type,
-        "price_data":     price_data,
-        "news":           news_data,
-        "uploaded_files": uploaded,
-        "telegram_digest": telegram_data,
-    }
-
-================================================================================
-FILE: C:/Users/kangw/ramp-bot/report_company.py
-================================================================================
-"""
-Report generation: calls Claude Opus 4.6 with extended thinking + web search tool.
-Exports report as PDF using fpdf2.
-"""
-
-import os
-import anthropic
-from datetime import datetime
-from pathlib import Path
-
-from gather_company import web_search
-
-SEARCH_TOOL = {
-    "name": "web_search",
-    "description": (
-        "Search the web for current information about companies, industries, competitors, "
-        "management, SEC filings, earnings calls, analyst reports, or macro context. "
-        "Use liberally to fill gaps in the provided data."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "The search query"}
-        },
-        "required": ["query"],
-    },
-}
-
-FRAMEWORK = """\
-You follow this research framework for every company ramp report:
-
-PART 1 — QUICK PASS/FAIL
-Answer: What would kill this idea? Try to rule it out quickly.
-Check: Management track record on M&A/turnarounds, earnings call clarity (do they dodge questions?),
-Glassdoor culture signals, intercompany transaction risks, opposing thesis not yet bottomed,
-cannibalization of own products, new entrant risk ("your margin is my opportunity").
-Verdict: Pass / Pass with caveats / Fail — explain briefly.
-
-PART 2 — EXECUTIVE SUMMARY
-- Business quality + current market sentiment (1 sentence)
-- Valuation vs peers (1 sentence)
-- Catalyst + expected upside over time frame (1 sentence)
-- Conclusion: Buy / Watch / Avoid
-
-PART 3 — COMPANY DEEP-DIVE
-- Value proposition and what the company does simply
-- Revenue/business model: how do they make money?
-- Product segments and geographic distribution
-- End customer segments, customer concentration, GTM/sales process
-- Supply chain: key suppliers, contracts, production capabilities
-- Management: background, compensation, ownership stake, M&A history, track record
-- Share price history: what has historically moved the stock?
-- Shareholding structure (institutional, insider, short interest)
-
-PART 4 — FINANCIALS
-
-4A. REVENUE BREAKDOWN
-- If the company reports multiple segments: show each segment's revenue, % of total, YoY growth rate, and CAGR over the available history. Use a table.
-- If the company is single-segment: note this explicitly ("Single reportable segment — no breakdown available") and provide total revenue history instead.
-- Include geographic breakdown if disclosed.
-- Use the SEC filing data provided (3 years of history). Fill forward estimates from web search / guidance.
-
-4B. GAAP AND NON-GAAP INCOME STATEMENTS
-
-Present four tables in this exact order:
-
-TABLE 1 — GAAP Income Statement ($M)
-Rows: Revenue | COGS | Gross Profit | R&D | Sales & Marketing | G&A | Total OpEx (below GP) | EBIT | Interest Income | Interest Expense | Other Income/(Expense) | EBT | Tax | Net Income
-Columns: each fiscal year available + NTM/forward estimate.
-Derive COGS from Revenue × (1 − Gross Margin%) if not directly stated. Show losses in parentheses.
-
-TABLE 2 — GAAP Common-Sized (% of Revenue)
-Same rows as Table 1. Every line expressed as % of revenue.
-
-TABLE 3 — Non-GAAP Income Statement ($M)
-Rows: Revenue | Adj. COGS | Adj. Gross Profit | Adj. R&D | Adj. S&M | Adj. G&A | Adj. EBITDA | D&A | Adj. EBIT | Interest & Other | Adj. EBT | Adj. Net Income | Adj. EPS | Adj. Diluted Shares
-
-TABLE 4 — Non-GAAP Common-Sized (% of Revenue)
-Same rows as Table 3. Every line expressed as % of revenue.
-
-LINE ITEM COMPOSITION (written explanation below the four tables — do NOT indent into the tables):
-After the four tables, write a section called "Line Item Breakdown" that explains what each line is made up of, based on what the company actually discloses in its filings and earnings releases. Cover every line item. Format as:
-
-**Revenue:** [what product/service lines or segments make up revenue, relative sizes]
-**COGS:** [what is inside cost of revenue — e.g. hosting/infrastructure, personnel costs, amortization of capitalized software, support costs — with approximate $ or % split where disclosed]
-**R&D:** [personnel, SBC, compute/cloud costs for R&D, any other disclosed items]
-**Sales & Marketing:** [personnel, commissions, SBC, advertising/demand gen, other]
-**G&A:** [personnel, SBC, legal/audit/insurance, other]
-**SBC total:** [total stock-based comp and how it is split across COGS/R&D/S&M/G&A]
-**D&A:** [depreciation split by asset type if disclosed — GPU/server depreciation, real estate, software; amortization of acquired intangibles]
-**Interest Income:** [cash/money market yield on cash balance]
-**Interest Expense:** [debt outstanding, rate, any convertible notes]
-**Tax:** [effective tax rate GAAP vs non-GAAP, deferred tax assets/NOL position]
-
-Then add commentary:
-- COGS composition: what are the biggest cost drivers — fixed vs variable, and how do they scale with revenue?
-- GAAP vs non-GAAP gap: what is excluded (SBC, D&A, restructuring)? Aggressive or reasonable?
-- Gross margin expansion: which specific sub-components are driving improvement?
-- Opex leverage: which line items are scaling efficiently vs growing faster than revenue?
-- Breakeven path: when does each major cost line cross a leverage threshold?
-
-MANAGEMENT EXPLANATION OF CHANGES (written section immediately after Line Item Breakdown):
-Pull directly from earnings call transcripts, press releases, and MD&A sections. For each major YoY change in revenue and margins, quote or closely paraphrase what management said was the reason. Structure as:
-
-**Revenue growth/decline — management explanation:** [exact reason given: new products, pricing, volume, geography, churn, macro, FX — with specific numbers cited by management]
-**Gross margin change — management explanation:** [what management said drove the expansion or compression: mix shift, pricing power, infra efficiency, GPU depreciation, headcount, hyperscaler discounts, etc.]
-**R&D change — management explanation:** [headcount additions, new product investments, any commentary on R&D efficiency]
-**S&M change — management explanation:** [go-to-market changes, sales headcount, marketing spend, CAC trends]
-**G&A change — management explanation:** [any scale efficiencies, one-time items, compliance costs]
-**Forward guidance rationale:** [what management said about why they guided the way they did — conservatism, visibility, known headwinds/tailwinds]
-
-Flag any discrepancy between what management said and what the numbers show (e.g. management claims gross margin improvement due to efficiency but COGS grew faster than revenue).
-
-4C. CREDIT METRICS
-Show BOTH sets of metrics — financial debt only AND lease-adjusted:
-  Financial debt metrics: Net Financial Debt / EBITDA, Interest Coverage (EBIT / Interest), Total Financial Debt / Equity
-  Lease-adjusted metrics: (Net Debt + Operating Lease Obligations) / EBITDA, Fixed Charge Coverage
-If zero financial debt: explicitly state this and flag as a balance sheet positive, but still show lease-adjusted leverage.
-Also show: Cash + equivalents, Revolver capacity (drawn vs undrawn), FCF conversion (FCF / Net Income), Capex / Revenue trend.
-
-4D. CASH FLOW
-- Operating cash flow, capex, free cash flow (last 3 years + NTM estimate)
-- Capex intensity (capex / revenue) and whether it is declining or rising
-- NWC dynamics: receivables days, inventory days, payables days if applicable
-- Reinvestment rate and return on invested capital (ROIC)
-
-4E. LTM AND NTM MULTIPLES
-EV/Revenue, EV/EBITDA, EV/EBIT, P/E, P/FCF — LTM and NTM side by side.
-
-4F. 10-YEAR DCF
-Build a full 10-year DCF. Show all assumptions explicitly in a table:
-  - Revenue growth rate by year (use guidance for Y1-2, taper to terminal for Y3-10)
-  - EBITDA margin by year
-  - D&A, Capex, Change in NWC assumptions
-  - Tax rate
-  - WACC: calculate explicitly — risk-free rate (current 10Y UST), equity risk premium (use 5.5%), beta (from data provided), cost of debt, target capital structure → show the WACC build
-  - Terminal value: calculate using BOTH Gordon Growth Model (terminal growth rate = 2.5%) AND Exit Multiple (EV/EBITDA). Show both implied share prices.
-  - Sensitivity table 1: implied share price vs Revenue CAGR (rows) × EBITDA margin (columns) — 3×3 grid
-  - Sensitivity table 2: implied share price vs WACC (rows) × Exit Multiple / Terminal Growth (columns) — 3×3 grid
-  - State clearly what growth and margin assumptions are currently priced in at the current share price.
-
-4G. MANAGEMENT GUIDANCE AND KEY SWING FACTORS
-- Full guidance table (revenue, EPS, margins, capex) with actuals vs consensus
-- Top 3 swing factors that could cause the stock to beat or miss
-
-PART 5 — INDUSTRY & COMPETITIVE POSITION
-- Industry trends and TAM (size + historical/forward growth)
-- Competitive landscape: segment leaders, challengers, disruptors
-- Company's differentiation vs competitors (qualitative + metrics)
-- Market share and trend
-- Regulatory environment
-
-PART 6 — MACRO REGIME CONTEXT
-Map the company into the current macro regime:
-Inflation vs Growth quadrant: Inflationary Boom / Inflationary Bust / Disinflationary Boom / Disinflationary Bust
-  → Playbook implications for this asset class
-Monetary Policy vs Growth quadrant: Slowing+Tightening / Slowing+Easing / Strong+Tightening / Strong+Easing
-  → Playbook implications
-Current narrative: Is the theme driving this stock sustainable? What kills the narrative? What is next?
-Sector tailwinds/headwinds from macro backdrop.
-
-PART 7 — VALUATION
-- Screen comparable companies (same sector, geography, business model, size)
-- Explain WHY multiples differ — growth-adjusted view (PEG, growth-adjusted EV/EBITDA)
-- Low/high multiples are appropriate at the right growth rate; don't exclude outliers blindly
-- DCF sanity check: what growth and margin assumptions are currently priced in?
-- Historical valuation range for the stock
-
-PART 8 — TECHNICALS & POSITIONING
-- Price vs 14d / 50d / 200d moving averages — where is it in the range?
-- RSI and momentum signals
-- Key support / resistance levels from recent price action
-- Historical analogue: find a similar setup in market history and what happened
-- Positioning: short interest trend, put/call ratio, COT if applicable
-- Sentiment: analyst consensus direction, recent upgrades/downgrades
-- Rule: positioning/sentiment are trend-following signals; fade only if extreme or new event will unwind them
-
-PART 9 — RISKS
-Answer: Why would someone sell this position to me?
-- Opposing thesis: has the bearish case bottomed out? Why now?
-- Cannibalization / intercompany transaction risks
-- Management fog: do they understand their own business? Do they follow through on guidance?
-- New entrant risk: is the margin too attractive to ignore?
-- Macro tail risks specific to this company (FX, rate sensitivity, credit, commodity exposure)
-- Structural change risk: is this a value trap or secular decline story?
-
-PART 10 — CATALYST & TRADE SETUP
-- Primary catalyst: what drives the narrative shift and when?
-- Key upcoming events: earnings date, product launches, regulatory decisions, macro data
-- Entry thesis: why now specifically?
-- Technical entry: do not place stops at obvious levels; use recent volatility to set width
-- Position sizing: rate conviction 1-10, assign 1-4% portfolio risk accordingly
-  (A 5/10 → 50-80% upside potential; a 4% position = comfortable buying 20% lower)
-- DCA approach if sizing up slowly
-- Options angle: if bimodal event, check if market is pricing normal distribution (mispricing opportunity)
-  Long-dated low-IV options may be underpriced for structural themes
-- Correlations to check: existing portfolio exposure by geography, sector, asset class
-"""
-
-
-def generate_report(ticker: str, gathered: dict) -> str:
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-    company_name = gathered.get("company_name", ticker)
-
-    prompt = f"""You are a sophisticated macro trader and equity analyst. Produce a comprehensive company ramp report for **{ticker} ({company_name})** using the framework below.
-
-{FRAMEWORK}
-
----
-
-## DATA PROVIDED
-
-### Yahoo Finance Data
-{gathered.get('yfinance') or 'Not available'}
-
-### Web News & Analyst Coverage
-{gathered.get('news') or 'Not available'}
-
-### SEC EDGAR Filings (8-K Press Release, 10-Q, 10-K)
-{gathered.get('sec') or 'Not available'}
-
-### Earnings Call Transcript
-{gathered.get('transcript') or 'Not available'}
-
-### User-Uploaded Research Files
-{gathered.get('uploaded_files') or 'None uploaded'}
-
-### Stock Digest (Telegram — last 1 year)
-{gathered.get('telegram_digest') or 'Not available'}
-
----
-
-## INSTRUCTIONS
-
-**UPLOADED FILES ARE YOUR PRIMARY SOURCE FOR FINANCIALS.**
-The user has uploaded analyst reports, models, and research files above. For Part 4 (all financial sections):
-- Extract every number you can from the uploaded files FIRST before using SEC or Yahoo Finance data
-- The uploaded Excel model is likely the most accurate and detailed financial model — use it as the authoritative source for revenue, margins, opex line items, EPS, capex, and DCF assumptions
-- The uploaded PDFs likely contain analyst estimates, price targets, and thesis — extract specific figures, not summaries
-- Where uploaded data conflicts with SEC/Yahoo Finance, prefer the uploaded data and note the discrepancy
-- If the model has a full income statement breakdown (R&D, S&M, G&A), use those exact figures — do not leave line items as n/a if the uploaded model has them
-
-Use the web_search tool liberally to:
-- Fill any gaps in the data above
-- Research competitors and industry dynamics
-- Find recent earnings call highlights and management commentary
-- Identify upcoming catalysts (next earnings date, conferences, regulatory)
-- Check Glassdoor / LinkedIn for management / culture signals
-- Find historical comparable setups in the market
-- Get latest analyst price targets and thesis
-
-Be specific — use numbers, percentages, and specific names. Avoid vague statements.
-Where data is genuinely unavailable after searching, say so explicitly.
-
-**CITE YOUR SOURCES THROUGHOUT.**
-Every factual claim, number, target, or data point must have a source tag immediately after it. Use these formats:
-- Uploaded file: [Source: Goldman Sachs initiation, Mar 2025] or [Source: uploaded model]
-- SEC filing: [Source: 10-Q Q3 2024] or [Source: 8-K press release]
-- Earnings call: [Source: Q4 2024 earnings call]
-- Web search: [Source: Bloomberg, Mar 2025] or [Source: WSJ] or [Source: web search]
-- yfinance data: [Source: yfinance]
-- Stock Digest Telegram: [Source: Stock Digest]
-If a figure appears in both an uploaded file and a web result, cite the uploaded file.
-Do NOT write entire paragraphs without any source tags.
-
-Start with Part 1 (Quick Pass/Fail). If this is an obvious fail, say so clearly and briefly.
-Then complete all 10 parts of the framework.
-"""
-
-    messages = [{"role": "user", "content": prompt}]
-
-    print(f"  Calling Claude Opus with extended thinking...")
-
-    while True:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            tools=[SEARCH_TOOL],
-            messages=messages,
-        )
-        if response.stop_reason != "tool_use":
-            break
-
-        tool_blocks = [b for b in response.content if b.type == "tool_use"]
-        print(f"  [web search x{len(tool_blocks)}] {', '.join(b.input['query'] for b in tool_blocks)}")
-
-        def _search(block):
-            return {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": web_search(block.input["query"]),
-            }
-
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(tool_blocks)) as pool:
-            tool_results = list(pool.map(_search, tool_blocks))
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
-
-    report_text = ""
-    for block in response.content:
-        if block.type == "text":
-            report_text = block.text.strip()
-
-    return report_text
-
-
-def export_docx(ticker: str, company_name: str, report_text: str, output_dir: str) -> str:
-    from docx import Document
-    from docx.shared import Pt
-    import re
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    safe_name = re.sub(r'[\\/:*?"<>|]', "", company_name).strip()
-    filename = f"{ticker}_{safe_name}_{date_str}.docx"
-    filepath = os.path.join(output_dir, filename)
-
-    doc = Document()
-    style = doc.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(11)
-
-    def add_runs(para, text):
-        """Add runs to a paragraph, bolding **text** spans."""
-        for part in re.split(r"(\*\*[^*]+\*\*|__[^_]+__)", text):
-            if (part.startswith("**") and part.endswith("**")) or \
-               (part.startswith("__") and part.endswith("__")):
-                para.add_run(part[2:-2]).bold = True
-            else:
-                para.add_run(part)
-
-    def add_table(table_lines):
-        """Parse markdown table lines and render as a Word table."""
-        parsed = []
-        for tl in table_lines:
-            if re.match(r"^\s*\|[-| :]+\|\s*$", tl):
-                continue  # skip separator rows
-            cells = [c.strip() for c in tl.strip("|").split("|")]
-            parsed.append(cells)
-        if not parsed:
-            return
-        ncols = max(len(r) for r in parsed)
-        tbl = doc.add_table(rows=len(parsed), cols=ncols)
-        tbl.style = "Table Grid"
-        for r_idx, row in enumerate(parsed):
-            for c_idx in range(ncols):
-                text = row[c_idx].replace("**", "").replace("__", "") if c_idx < len(row) else ""
-                cell = tbl.cell(r_idx, c_idx)
-                cell.text = ""
-                run = cell.paragraphs[0].add_run(text)
-                if r_idx == 0:
-                    run.bold = True
-        doc.add_paragraph()
-
-    lines = report_text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # Markdown table block
-        if stripped.startswith("|"):
-            block = []
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                block.append(lines[i])
-                i += 1
-            add_table(block)
-            continue
-
-        if stripped.startswith("# "):
-            doc.add_heading(stripped[2:], level=1)
-        elif stripped.startswith("## "):
-            doc.add_heading(stripped[3:], level=2)
-        elif stripped.startswith("### "):
-            doc.add_heading(stripped[4:], level=3)
-        elif not stripped or stripped in ("---", "==="):
-            doc.add_paragraph()
-        elif re.match(r"^[-*] ", stripped):
-            add_runs(doc.add_paragraph(style="List Bullet"), stripped[2:])
-        elif re.match(r"^\d+\. ", stripped):
-            add_runs(doc.add_paragraph(style="List Number"), re.sub(r"^\d+\. ", "", stripped))
-        else:
-            add_runs(doc.add_paragraph(), stripped)
-
-        i += 1
-
-    doc.save(filepath)
-    print(f"  Docx saved: {filepath}")
-    return filepath
-
-
-def export_pdf(docx_path: str) -> str:
-    from docx2pdf import convert
-    pdf_path = docx_path.replace(".docx", ".pdf")
-    convert(docx_path, pdf_path)
-    print(f"  PDF saved: {pdf_path}")
-    return pdf_path
-
-================================================================================
-FILE: C:/Users/kangw/ramp-bot/report_macro.py
-================================================================================
-"""
-Macro ramp report generation: calls Claude Opus 4.6 with extended thinking + web search.
-Exports report as Word doc and PDF.
-"""
-
-import os
-import re
-import anthropic
-from datetime import datetime
-from pathlib import Path
-
-from gather_macro import web_search
-
-SEARCH_TOOL = {
-    "name": "web_search",
-    "description": (
-        "Search the web for current macro data, central bank policy, positioning, "
-        "COT reports, economic releases, analyst forecasts, or geopolitical context. "
-        "Use liberally to fill gaps in the provided data."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "The search query"}
-        },
-        "required": ["query"],
-    },
-}
-
-FRAMEWORK = """\
-You follow this research framework for every macro asset ramp report.
-
-PART 1 — QUICK PASS/FAIL
-What kills this trade immediately?
-- Is the macro regime directly opposed to this direction?
-- Is positioning already at extremes in the direction you want to trade?
-- Is the narrative fully priced in with no remaining catalyst?
-- Is there an imminent event that invalidates the thesis?
-Verdict: Pass / Pass with caveats / Fail — be direct.
-
-PART 2 — EXECUTIVE SUMMARY
-- Current regime + asset momentum (1 sentence)
-- Key driver and conviction level (1 sentence)
-- Trade thesis + expected move + time frame (1 sentence)
-- Conclusion: Long / Short / Watch / Avoid
-
-PART 3 — ASSET PROFILE
-- What is this asset and how does it trade? (spot, futures, ETF proxies, trading hours)
-- Key market participants: commercials, speculators, central banks, real money, retail
-- Typical daily/weekly volatility, ATR as % of price, normal move sizes
-- Key correlations: list 5+ assets it moves with/against and directionality
-- Carry/roll characteristics: cost of carry, futures curve structure if applicable
-
-PART 4 — FUNDAMENTAL DRIVERS
-Present this section based on the asset class:
-
-FOR COMMODITIES:
-- Supply: production levels, OPEC/producer cartel decisions, supply disruptions, inventory levels (EIA/LME/CFTC stocks) vs 5-year average
-- Demand: key demand drivers, geographic concentration (China share), demand trend
-- Cost curve: marginal cost of production, where does the cost curve support price?
-- Futures curve: contango or backwardation? Implied carry cost/roll yield
-- USD sensitivity: historical correlation with DXY, current reading
-- Seasonal patterns: typical seasonal move for this time of year
-
-FOR RATES:
-- Central bank: current policy rate, last decision, forward guidance, next meeting date, market-implied rate path (show OIS-implied path for next 12 months)
-- Inflation: current CPI/PCE level and trend, 5Y5Y breakeven, 2Y2Y breakeven, real yield level vs history
-- Growth: current GDP run rate, ISM PMIs, employment trend, leading indicators
-- Term premium: current ACM term premium or equivalent, vs history
-- Supply/demand: Treasury issuance calendar, Fed QT pace, foreign demand trend (Fed custody holdings), TIC data
-- Fiscal: deficit trajectory, debt/GDP, upcoming auctions
-
-FOR FX:
-- Rate differential: current short-rate differential (e.g. Fed Funds vs ECB rate), 2Y swap spread, direction of travel
-- Real rate differential: inflation-adjusted yield spread vs history
-- Growth differential: relative GDP/PMI momentum, which economy is accelerating?
-- Current account: trade balance trend, current account surplus/deficit as % GDP for each country
-- Central bank divergence: which CB is more hawkish/dovish? Next meeting dates for both
-- Positioning: latest IMM speculative net positioning vs 1Y range (z-score)
-- PPP fair value: OECD PPP or Big Mac index — % over/undervalued at current spot
-
-FOR EQUITY INDEXES:
-- Earnings: current NTM EPS consensus, revision trend (breadth of upgrades vs downgrades), earnings beat rate
-- Valuation: forward P/E vs 10Y average, Shiller CAPE, equity risk premium (earnings yield minus real 10Y yield)
-- Liquidity: Fed/ECB/BOJ balance sheet direction, M2 growth rate, Goldman/Bloomberg financial conditions index
-- Risk appetite: VIX level + trend, HY credit spreads, IG spreads, EM capital flows
-- Sector composition: top 3 sectors by weight, top 10 names concentration %, recent sector rotation
-- Buyback/dividend yield as price support
-
-PART 5 — MACRO REGIME MAPPING
-Map the current environment:
-- Inflation/Growth quadrant: Inflationary Boom / Inflationary Bust / Disinflationary Boom / Disinflationary Bust
-  → How has this asset class performed historically in this quadrant? Give specific return data.
-- Monetary policy cycle: Early tightening / Peak tightening / Early easing / Deep easing
-  → How does this asset typically perform at this stage?
-- Current narrative: what is the market's dominant thesis? Is it sustainable or approaching exhaustion?
-- Regime change risk: what macro data would trigger a regime shift?
-
-PART 6 — POSITIONING & SENTIMENT
-- COT report (CFTC): net speculative positioning — current absolute level, vs 1Y range, z-score, direction of recent change
-- ETF flows: recent weekly/monthly flows into relevant ETFs (direction, magnitude, trend)
-- Options market: current implied vol level, IV rank/percentile vs 1Y, put/call ratio, skew (for FX: risk reversals)
-- Analyst/strategist consensus: median target, distribution of forecasts, recent upgrades/downgrades
-- Retail sentiment indicators (AAII, CNN Fear & Greed if applicable)
-- Crowding assessment: is this a consensus trade? What is the exit risk if wrong?
-
-PART 7 — TECHNICALS
-- Current price vs 14d/50d/200d MAs: above/below each, % gap, MA alignment (bullish/bearish/mixed)
-- RSI(14): current level, trend, any divergences with price
-- Key support levels: S1, S2, S3 with specific prices and reasoning (prior highs/lows, MAs, round numbers, Fibonacci)
-- Key resistance levels: R1, R2, R3 with specific prices and reasoning
-- Volume/open interest trend: is the move confirmed or suspect?
-- Weekly/monthly chart context: is the longer-term trend supportive of the trade?
-- Historical analogue: identify a similar price pattern or macro setup from history. What happened? How long did it take?
-
-PART 8 — CROSS-ASSET CONTEXT
-- Risk-on / risk-off classification for this asset
-- Rolling 30-day correlations to: USD (DXY), S&P 500, 10Y yields, gold, crude oil (use whichever are most relevant)
-- Any correlation breakdown vs historical norm? Flag explicitly as a potential signal
-- How does this asset fit in a macro portfolio? (diversifier, hedge, risk asset, carry trade)
-- Current cross-asset signals that confirm or contradict the thesis
-
-PART 9 — VALUATION / FAIR VALUE
-Build a fair value estimate:
-- FX: OECD PPP model, BEER model (real effective exchange rate), % over/undervalued, historical mean reversion time
-- Rates: Taylor rule implied rate, neutral real rate (r*) estimate, fair yield based on inflation breakevens + term premium
-- Commodities: cost of production / marginal cost floor, supply/demand equilibrium price model, historical inflation-adjusted price percentile
-- Equity indexes: forward P/E vs historical average + premium/discount, Shiller CAPE implied 10Y return, ERP model (earnings yield vs bond yield)
-Show current price vs fair value estimate and the % deviation.
-
-PART 10 — RISKS
-What would force a position reversal?
-- Bear case: construct the full opposing thesis — don't strawman it
-- Key data/events that could invalidate within 2-4 weeks
-- Geopolitical tail risks specific to this asset
-- Positioning unwind risk: what happens if consensus is wrong?
-- Liquidity risk: can you hold through a 2-sigma adverse move? What is the margin/funding cost?
-- Correlation breakdown: what if this asset stops behaving as expected?
-
-PART 11 — CATALYST & TRADE SETUP
-- Primary catalyst: what drives the move and specific timing
-- Key upcoming events calendar (next 60 days): CB meetings, CPI/NFP/GDP prints, OPEC, earnings seasons, elections, Treasury auctions — with dates
-- Entry: specific level and timing rationale (do not chase)
-- Stop: specific level with reasoning (do NOT place at obvious round numbers or recent extremes — use ATR to set width)
-- Targets: T1 (conservative), T2 (base case), T3 (extended) with specific levels and reasoning
-- Time frame: expected hold period (days / weeks / months)
-- R:R ratio: state explicitly. Minimum 2:1, prefer 3:1+
-- Position sizing: rate conviction 1-10, assign 1-4% portfolio risk accordingly
-- Hedge: what offsetting position reduces tail risk without killing the trade?
-- Options angle: check if implied vol is cheap or expensive (IV rank). Is there a risk reversal or spread structure that improves R:R?
-- DCA plan if scaling in
-"""
-
-
-def generate_report(gathered: dict) -> str:
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-    display_name = gathered.get("display_name", gathered.get("asset_input", "unknown"))
-    asset_type   = gathered.get("asset_type", "unknown")
-
-    prompt = f"""You are a sophisticated macro trader and global macro analyst. \
-Produce a comprehensive macro ramp report for **{display_name}** ({asset_type.upper()}) \
-using the framework below.
-
-{FRAMEWORK}
-
----
-
-## DATA PROVIDED
-
-### Price Data & Technicals
-{gathered.get('price_data') or 'Not available'}
-
-### Macro News & Context
-{gathered.get('news') or 'Not available'}
-
-### User-Uploaded Research Files
-{gathered.get('uploaded_files') or 'None uploaded'}
-
-### News Digest (Telegram — last 30 days)
-{gathered.get('telegram_digest') or 'Not available'}
-
----
-
-## INSTRUCTIONS
-
-**UPLOADED FILES ARE YOUR PRIMARY SOURCE. READ THEM FIRST, BEFORE ANYTHING ELSE.**
-The user has uploaded research files (broker reports, models, positioning data). For every section:
-- Extract every number, target, positioning figure, and trade idea from the uploaded files FIRST
-- Use uploaded files as the authoritative source — they override yfinance/web data where they conflict
-- If a broker report has a specific price target, entry, stop, or thesis: quote it directly and build on it
-- If a model is uploaded: extract all key figures (fair value, returns, assumptions) and reference them explicitly
-- Do NOT leave any section as "unknown" or "unavailable" if the uploaded files contain the data
-- Quote specific page/section references from the uploaded files where helpful
-
-Use the web_search tool liberally to:
-- Get latest COT/CFTC positioning data for this asset
-- Find current central bank statements, meeting minutes, forward guidance
-- Check latest economic data releases (CPI, NFP, PMI, GDP) and surprises
-- Find analyst and strategist price targets and recent changes
-- Get current futures curve / forward rates / breakeven inflation
-- Search for historical analogues and comparable market setups
-- Check current ETF flow data and options market positioning
-
-Be specific — use exact numbers, dates, levels, and names. Never be vague.
-Where data is genuinely unavailable after searching, say so explicitly with a note on what to check manually.
-
-**CITE YOUR SOURCES THROUGHOUT.**
-Every factual claim, number, target, or data point must have a source tag immediately after it. Use these formats:
-- Uploaded file: [Source: uploaded broker report] or [Source: uploaded model]
-- Web search: [Source: Bloomberg, Mar 2025] or [Source: Reuters] or [Source: web search]
-- yfinance/price data: [Source: yfinance]
-- COT/CFTC data: [Source: CFTC COT report]
-- Central bank: [Source: Fed statement] or [Source: ECB minutes]
-- News Digest Telegram: [Source: News Digest]
-If a figure appears in both an uploaded file and a web result, cite the uploaded file.
-Do NOT write entire paragraphs without any source tags.
-
-Start with Part 1 (Quick Pass/Fail). If this is an obvious fail, say so clearly and briefly.
-Then complete all 11 parts of the framework.
-"""
-
-    messages = [{"role": "user", "content": prompt}]
-
-    print(f"  Calling Claude Opus with extended thinking...")
-
-    while True:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            tools=[SEARCH_TOOL],
-            messages=messages,
-        )
-        if response.stop_reason != "tool_use":
-            break
-
-        tool_blocks = [b for b in response.content if b.type == "tool_use"]
-        print(f"  [web search x{len(tool_blocks)}] {', '.join(b.input['query'] for b in tool_blocks)}")
-
-        def _search(block):
-            return {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": web_search(block.input["query"]),
-            }
-
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(tool_blocks)) as pool:
-            tool_results = list(pool.map(_search, tool_blocks))
-
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
-
-    report_text = ""
-    for block in response.content:
-        if block.type == "text":
-            report_text = block.text.strip()
-
-    return report_text
-
-
-def export_docx(asset_input: str, display_name: str, report_text: str, output_dir: str) -> str:
-    from docx import Document
-    from docx.shared import Pt
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    safe_name = re.sub(r'[\\/:*?"<>|]', "", display_name).strip().replace(" ", "_")
-    filename = f"{asset_input.upper()}_{safe_name}_{date_str}.docx"
-    filepath = os.path.join(output_dir, filename)
-
-    doc = Document()
-    style = doc.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(11)
-
-    def add_runs(para, text):
-        for part in re.split(r"(\*\*[^*]+\*\*|__[^_]+__)", text):
-            if (part.startswith("**") and part.endswith("**")) or \
-               (part.startswith("__") and part.endswith("__")):
-                para.add_run(part[2:-2]).bold = True
-            else:
-                para.add_run(part)
-
-    def add_table(table_lines):
-        parsed = []
-        for tl in table_lines:
-            if re.match(r"^\s*\|[-| :]+\|\s*$", tl):
-                continue
-            cells = [c.strip() for c in tl.strip("|").split("|")]
-            parsed.append(cells)
-        if not parsed:
-            return
-        ncols = max(len(r) for r in parsed)
-        tbl = doc.add_table(rows=len(parsed), cols=ncols)
-        tbl.style = "Table Grid"
-        for r_idx, row in enumerate(parsed):
-            for c_idx in range(ncols):
-                text = row[c_idx].replace("**", "").replace("__", "") if c_idx < len(row) else ""
-                cell = tbl.cell(r_idx, c_idx)
-                cell.text = ""
-                run = cell.paragraphs[0].add_run(text)
-                if r_idx == 0:
-                    run.bold = True
-        doc.add_paragraph()
-
-    lines = report_text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if stripped.startswith("|"):
-            block = []
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                block.append(lines[i])
-                i += 1
-            add_table(block)
-            continue
-
-        if stripped.startswith("# "):
-            doc.add_heading(stripped[2:], level=1)
-        elif stripped.startswith("## "):
-            doc.add_heading(stripped[3:], level=2)
-        elif stripped.startswith("### "):
-            doc.add_heading(stripped[4:], level=3)
-        elif not stripped or stripped in ("---", "==="):
-            doc.add_paragraph()
-        elif re.match(r"^[-*] ", stripped):
-            add_runs(doc.add_paragraph(style="List Bullet"), stripped[2:])
-        elif re.match(r"^\d+\. ", stripped):
-            add_runs(doc.add_paragraph(style="List Number"), re.sub(r"^\d+\. ", "", stripped))
-        else:
-            add_runs(doc.add_paragraph(), stripped)
-
-        i += 1
-
-    doc.save(filepath)
-    print(f"  Docx saved: {filepath}")
-    return filepath
-
-
-def export_pdf(docx_path: str) -> str:
-    from docx2pdf import convert
-    pdf_path = docx_path.replace(".docx", ".pdf")
-    convert(docx_path, pdf_path)
-    print(f"  PDF saved: {pdf_path}")
-    return pdf_path
-
-================================================================================
-FILE: C:/Users/kangw/ramp-bot/tg_group.py
+FILE: tg_group.py
 ================================================================================
 """
 Sends ramp reports (text + docx + PDF) to a Telegram group via Telethon.
@@ -2649,3 +484,75 @@ def send_to_group(report_text: str, doc_path: str, pdf_path: str,
     """Synchronous wrapper — call from a thread executor."""
     asyncio.run(_send(report_text, doc_path, pdf_path, label, asset, group_name, about))
 
+================================================================================
+SUPPORTED MACRO ASSETS (150+ instruments, all in gather_macro.py ASSET_MAP):
+================================================================================
+
+PRECIOUS METALS: GOLD SILVER PLATINUM PALLADIUM GLD SLV GDX GDXJ
+ENERGY: WTI BRENT NATGAS RBOB HEATINGOIL USO UNG
+BASE METALS: COPPER ALUMINUM ZINC NICKEL
+AGRICULTURAL: WHEAT CORN SOYBEAN SOYMEAL SOYOIL COFFEE SUGAR COCOA COTTON CATTLE HOGS LUMBER OJ DBA
+
+US RATES: US2Y US5Y US10Y US30Y TLT IEF SHY TBT TMF TMV HYG JNK LQD EMB TIPS
+GLOBAL RATES: BUND GILT JGB
+
+G10 FX: EURUSD USDJPY GBPUSD AUDUSD NZDUSD USDCAD USDCHF DXY UUP
+CROSSES: EURJPY EURGBP GBPJPY AUDJPY EURAUD EURCHF GBPAUD
+EM FX: USDCNY USDCNH USDINR USDBRL USDMXN USDZAR USDTRY USDKRW USDSGD USDHKD USDTHB USDIDR USDPLN USDSEK USDNOK
+
+US INDEXES: SPX NDX DOW RUSSELL VIX SPY QQQ IWM DIA
+EUROPEAN INDEXES: FTSE DAX CAC IBEX SMI AEX MIB STOXX50 VSTOXX
+ASIA-PACIFIC INDEXES: NIKKEI TOPIX HSI CSI300 KOSPI ASX200 SENSEX NIFTY TWSE STI
+EM INDEXES: BOVESPA MEXBOL EEM VWO EWZ
+
+CRYPTO: BTC ETH SOL XRP IBIT FBTC
+
+Anything NOT in this list is treated as a company ticker (e.g., NVDA, AAPL, TSLA).
+
+================================================================================
+COMPANY REPORT FRAMEWORK (10 parts, in report_company.py):
+================================================================================
+1. Quick Pass/Fail
+2. Executive Summary
+3. Company Profile
+4. Financials (4-table format: Income, Balance Sheet, Cash Flow, Per-Share + Line Item Breakdown + Management Explanation)
+5. Valuation
+6. Industry & Competitive Position
+7. Growth Catalysts & Risks
+8. Technicals
+9. Sentiment & Positioning
+10. Trade Setup
+
+================================================================================
+MACRO REPORT FRAMEWORK (11 parts, in report_macro.py):
+================================================================================
+1. Quick Pass/Fail
+2. Executive Summary
+3. Asset Profile
+4. Fundamental Drivers (varies by asset class: commodity/rates/fx/equity)
+5. Macro Regime Mapping
+6. Positioning & Sentiment
+7. Technicals
+8. Cross-Asset Context
+9. Valuation / Fair Value
+10. Risks
+11. Catalyst & Trade Setup
+
+================================================================================
+SETUP FROM SCRATCH:
+================================================================================
+
+1. Create GitHub repo (public or private)
+2. Push all files to main branch
+3. Add GitHub Secrets: ANTHROPIC_API_KEY, BOT_TOKEN, TELEGRAM_SESSION
+4. Create Cloudflare Worker:
+   - Paste worker.js code
+   - Add KV namespace binding: RAMP_KV
+   - Add env vars: BOT_TOKEN, GITHUB_TOKEN, GITHUB_REPO, ALLOWED_CHAT_ID
+5. Set Telegram webhook:
+   https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=<WORKER_URL>
+6. Test: send /status to bot on Telegram
+
+================================================================================
+END
+================================================================================

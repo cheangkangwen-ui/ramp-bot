@@ -33,9 +33,10 @@ export default {
 
     const chat_id = String(message.chat.id);
 
-    // Auth check
-    if (env.ALLOWED_CHAT_ID && chat_id !== String(env.ALLOWED_CHAT_ID)) {
-      return new Response("ok");
+    // Auth check — supports comma-separated IDs (e.g. "233058647,501547132")
+    if (env.ALLOWED_CHAT_ID) {
+      const allowed = String(env.ALLOWED_CHAT_ID).split(",").map(s => s.trim());
+      if (!allowed.includes(chat_id)) return new Response("ok");
     }
 
     const text = message.text || message.caption || "";
