@@ -111,7 +111,7 @@ def main():
 
         send_message(f"Data loaded for {company_name}. Generating report...")
 
-        text     = generate_report(gathered)
+        text     = generate_report(ASSET, gathered)
         doc_path = export_docx(ASSET, company_name, text, str(REPORTS_DIR))
         pdf_path = export_pdf(doc_path)
 
