@@ -43,12 +43,29 @@ PART 2 — EXECUTIVE SUMMARY
 - Conclusion: Buy / Watch / Avoid
 
 PART 3 — COMPANY DEEP-DIVE
+
+3A. BUSINESS MODEL DECOMPOSITION
 - Value proposition and what the company does simply
 - Revenue/business model: how do they make money?
+- Classify market structure: monopoly, commodity, branded commodity, or oligopoly. Explain how this shapes competitive behavior.
+- Classify business model type: retailer, wholesaler, processor, or platform. Explain how this dictates P&L structure, key metrics, and what "good" looks like.
+- Cross-industry pattern match: identify a business in a different sector that operates the same way (e.g., TSMC and US Steel are both high fixed cost volume businesses; hotels and hospitals are the same business; cruise lines = stadium ticketing). Explain what this analogy tells us about how the company will behave.
+- Identify the company's non-obvious leverage points (scale points) — variables that disproportionately affect results but are not widely tracked.
+- Which themes are acting on this business? Check: technology shift, demographic shift, act of god, regulatory change, geopolitical shift, monetary/fiscal policy shift, commodity/resource cycle, consumer behavior shift, industry consolidation/fragmentation.
 - Product segments and geographic distribution
 - End customer segments, customer concentration, GTM/sales process
 - Supply chain: key suppliers, contracts, production capabilities
+
+3B. INVENTORY ANALYSIS
+- Current inventory levels, days inventory outstanding, YoY change
+- Inventory relative to revenue growth — is inventory building faster than sales (bullwhip risk)?
+- Channel inventory: are distributors/retailers overstocked or understocked?
+- Lead times: lengthening or shortening? What does this signal about demand?
+- Historical inventory cycles for this company and what happened after previous buildups/drawdowns
+
+3C. MANAGEMENT & OWNERSHIP
 - Management: background, compensation, ownership stake, M&A history, track record
+- Management strategic vision: how do they make pricing and capital allocation decisions?
 - Share price history: what has historically moved the stock?
 - Shareholding structure (institutional, insider, short interest)
 
@@ -149,6 +166,7 @@ PART 5 — INDUSTRY & COMPETITIVE POSITION
 - Company's differentiation vs competitors (qualitative + metrics)
 - Market share and trend
 - Regulatory environment
+- Historical playbook: find a comparable company or situation from history (e.g., similar competitive dynamics, market structure shift, regulatory event). What happened? What was the timeline? Use this as a playbook for what could happen here.
 
 PART 6 — MACRO REGIME CONTEXT
 Map the company into the current macro regime:
@@ -175,7 +193,40 @@ PART 8 — TECHNICALS & POSITIONING
 - Sentiment: analyst consensus direction, recent upgrades/downgrades
 - Rule: positioning/sentiment are trend-following signals; fade only if extreme or new event will unwind them
 
-PART 9 — RISKS
+PART 9 — DECISION TREE AND SELF-DEBATE
+
+9A. DECISION TREE
+Map ALL possible outcomes for this company over the next 12 months — not just the bull case.
+Structure as a tree with branches and assign a probability to each:
+- Bull case (describe specifically): __% probability
+- Base case (describe specifically): __% probability
+- Bear case (describe specifically): __% probability
+- Tail risk / black swan (describe specifically): __% probability
+For each branch: what would the stock price be? What data would confirm you are on this branch?
+State which branch the current market price implies.
+
+9B. SELF-DEBATE: BULL vs BEAR
+Present a genuine, rigorous debate between the bull and bear case. Do NOT strawman the opposing side.
+
+THE BULL CASE:
+- Steelman the strongest possible long thesis. Use specific numbers, comparable situations, and catalysts.
+- What historical analogy supports this? (e.g., "This looks like Abercrombie in 2017 when...")
+- What data would confirm the bull case is playing out?
+
+THE BEAR CASE:
+- Steelman the strongest possible short thesis with equal rigor. Assume you are a PM who is short this stock and needs to defend the position.
+- What historical analogy supports this? (e.g., "This looks like Under Armour in 2017 when...")
+- What data would confirm the bear case is playing out?
+- "Founders are fascinating — but never buy the whole story. Management operates in the same fog."
+
+RESOLUTION:
+- Which side has more evidence RIGHT NOW?
+- What is the single most important data point that would flip your view?
+- Are there any signals (low, medium, or high grade) that the market is ignoring?
+- Could both sides be right on different time horizons? (e.g., bear near-term, bull long-term)
+- "The fact that we're debating about a bubble means there's a bubble" — does this apply here?
+
+9C. RISKS
 Answer: Why would someone sell this position to me?
 - Opposing thesis: has the bearish case bottomed out? Why now?
 - Cannibalization / intercompany transaction risks
@@ -183,18 +234,23 @@ Answer: Why would someone sell this position to me?
 - New entrant risk: is the margin too attractive to ignore?
 - Macro tail risks specific to this company (FX, rate sensitivity, credit, commodity exposure)
 - Structural change risk: is this a value trap or secular decline story?
+- Inventory risk: is the channel overstocked? Is there a bullwhip risk?
+- Default to pessimism for M&A, turnarounds, and projections.
 
 PART 10 — CATALYST & TRADE SETUP
 - Primary catalyst: what drives the narrative shift and when?
 - Key upcoming events: earnings date, product launches, regulatory decisions, macro data
 - Entry thesis: why now specifically?
+- Historical playbook: "When was the last time you saw this? What happened after? What was the timeline?"
 - Technical entry: do not place stops at obvious levels; use recent volatility to set width
 - Position sizing: rate conviction 1-10, assign 1-4% portfolio risk accordingly
   (A 5/10 → 50-80% upside potential; a 4% position = comfortable buying 20% lower)
+  State which decision tree branch justifies the sizing.
 - DCA approach if sizing up slowly
 - Options angle: if bimodal event, check if market is pricing normal distribution (mispricing opportunity)
   Long-dated low-IV options may be underpriced for structural themes
 - Correlations to check: existing portfolio exposure by geography, sector, asset class
+- What would make you exit? Define the specific data point or price level that invalidates your thesis — not just a stop loss, but the fundamental signal that means your decision tree branch was wrong.
 """
 
 

@@ -90,11 +90,14 @@ FOR EQUITY INDEXES:
 PART 5 — MACRO REGIME MAPPING
 Map the current environment:
 - Inflation/Growth quadrant: Inflationary Boom / Inflationary Bust / Disinflationary Boom / Disinflationary Bust
+  → Playbook: Inflationary Bust = buy cash in reserve currencies, sell financial assets. Disinflationary Bust = buy bonds, sell everything else. Inflationary Boom = buy store of value (RE, Gold, Commodities, Cyclicals), sell high-duration bonds. Disinflationary Boom = buy innovative/risky equities, sell companies with low pricing power.
   → How has this asset class performed historically in this quadrant? Give specific return data.
-- Monetary policy cycle: Early tightening / Peak tightening / Early easing / Deep easing
-  → How does this asset typically perform at this stage?
-- Current narrative: what is the market's dominant thesis? Is it sustainable or approaching exhaustion?
+- Monetary Policy/Growth quadrant: Slowing+Tightening / Slowing+Easing / Strong+Tightening / Strong+Easing
+  → Playbook: Slowing+Tightening = buy defensive (DXY, Cash, VIX, Puts). Slowing+Easing = buy FI, Growth, DM equities. Strong+Tightening = buy high-beta real economy (EM, Value, Cyclicals). Strong+Easing = buy everything, sell DXY/Cash/Vol.
+- Current narrative: what is the market's dominant thesis? Is it sustainable or approaching exhaustion? What is the NEXT narrative and why?
 - Regime change risk: what macro data would trigger a regime shift?
+- What was traditionally a price driver but is now not priced in (for sudden surprise upside/downside)?
+- Historical analogue: what is a similar period in history and what happened? Use this as a playbook for timing and magnitude.
 
 PART 6 — POSITIONING & SENTIMENT
 - COT report (CFTC): net speculative positioning — current absolute level, vs 1Y range, z-score, direction of recent change
@@ -128,9 +131,41 @@ Build a fair value estimate:
 - Equity indexes: forward P/E vs historical average + premium/discount, Shiller CAPE implied 10Y return, ERP model (earnings yield vs bond yield)
 Show current price vs fair value estimate and the % deviation.
 
-PART 10 — RISKS
+PART 10 — DECISION TREE AND SELF-DEBATE
+
+10A. DECISION TREE
+Map ALL possible macro outcomes over the next 3-6 months.
+Structure as a tree with branches and assign a probability to each:
+- Bull case for this asset (describe the macro scenario specifically): __% probability
+- Base case (describe specifically): __% probability
+- Bear case for this asset (describe the macro scenario specifically): __% probability
+- Tail risk / regime break (describe specifically): __% probability
+For each branch: what would the price be? What data would confirm you are on this branch?
+State which branch the current market price implies.
+
+10B. SELF-DEBATE: BULL vs BEAR
+Present a genuine, rigorous debate. Do NOT strawman the opposing side.
+
+THE BULL CASE:
+- Steelman the strongest possible case for going long. Use specific macro data, historical analogues, and catalysts.
+- What historical period supports this? (e.g., "This setup looks like Q4 2016 when...")
+- What data would confirm the bull case is playing out?
+
+THE BEAR CASE:
+- Steelman the strongest possible case for going short with equal rigor.
+- What historical period supports this?
+- What data would confirm the bear case is playing out?
+
+RESOLUTION:
+- Which side has more evidence RIGHT NOW?
+- What is the single most important data point or event that would flip your view?
+- Are there any signals the market is ignoring? (If bad/good news does not move the price, that signals strong sentiment — note this.)
+- Could both sides be right on different time horizons?
+- "The fact that we're debating about a bubble means there's a bubble" — does this apply here?
+- "Whenever the market is pointing at something and saying this is a risk to be concerned about, most of the time the risk ends up being not as bad as anticipated. The opposite also holds — if the market does not talk about the risk."
+
+10C. RISKS
 What would force a position reversal?
-- Bear case: construct the full opposing thesis — don't strawman it
 - Key data/events that could invalidate within 2-4 weeks
 - Geopolitical tail risks specific to this asset
 - Positioning unwind risk: what happens if consensus is wrong?
