@@ -64,6 +64,14 @@ export default {
     if (message.document) {
       const file_id   = message.document.file_id;
       const file_name = message.document.file_name || "upload";
+      const ext = (file_name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
+      const supported = [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv"];
+      if (!supported.includes(ext)) {
+        await sendMessage(env.BOT_TOKEN, chat_id,
+          `Unsupported file type: ${ext || "(none)"}\nSupported: PDF, Word (.docx/.doc), Excel (.xlsx/.xls), CSV`
+        );
+        return new Response("ok");
+      }
       const caption   = (message.caption || "").replace(/\/ramp\s+\S+\s*/i, "").trim();
 
       const staged = await getStaged(env, chat_id);

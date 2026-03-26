@@ -288,11 +288,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fname = doc.file_name or f"upload_{doc.file_id}"
     ext   = Path(fname).suffix.lower()
-    supported = {".pdf", ".xlsx", ".xls", ".csv"}
+    supported = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv"}
 
     if ext not in supported:
         await update.message.reply_text(
-            f"Unsupported file type: {ext}\nSupported: PDF, Excel (.xlsx/.xls), CSV"
+            f"Unsupported file type: {ext}\nSupported: PDF, Word (.docx/.doc), Excel (.xlsx/.xls), CSV"
         )
         return
 

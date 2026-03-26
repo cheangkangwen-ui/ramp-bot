@@ -677,6 +677,22 @@ def parse_excel(file_path: str) -> str:
         return f"[Excel/CSV extraction failed: {e}]"
 
 
+def parse_docx(file_path: str) -> str:
+    try:
+        from docx import Document
+        doc = Document(file_path)
+        text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                text_parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+        full_text = "\n\n".join(text_parts).strip()
+        if len(full_text) > MAX_CHARS_FILE:
+            full_text = full_text[:MAX_CHARS_FILE] + "\n\n[... truncated ...]"
+        return full_text
+    except Exception as e:
+        return f"[DOCX extraction failed: {e}]"
+
+
 def parse_uploaded_files(file_paths: list, captions: dict = None) -> str:
     if not file_paths:
         return ""
@@ -689,6 +705,8 @@ def parse_uploaded_files(file_paths: list, captions: dict = None) -> str:
         name = Path(fp).name
         if ext == ".pdf":
             content = parse_pdf(fp)
+        elif ext in (".docx", ".doc"):
+            content = parse_docx(fp)
         elif ext in (".xlsx", ".xls", ".csv"):
             content = parse_excel(fp)
         else:

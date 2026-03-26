@@ -24,7 +24,7 @@ ARCHITECTURE:
 
 KEY DESIGN DECISIONS:
 - Auto-detect mode via ASSET_MAP lookup in gather_macro.py
-- Uploaded files are PRIMARY source for both modes
+- Uploaded files are PRIMARY source for both modes (supports PDF, DOCX, Excel, CSV)
 - Parallel web search via ThreadPoolExecutor during Claude report generation
 - Word doc (.docx) via python-docx + PDF via LibreOffice headless
 - Company: 10-part framework | Macro: 11-part framework
@@ -38,8 +38,8 @@ C:/Users/kangw/ramp-bot/
   worker.js             # Cloudflare Worker — webhook, KV file staging, triggers GitHub Actions
   bot_runner.py         # GitHub Actions entry point — downloads files, gathers, reports, sends
   bot.py                # Legacy local bot entry point (not used in serverless setup)
-  gather_company.py     # yfinance, SEC EDGAR, web search, earnings transcript, Telegram digest
-  gather_macro.py       # yfinance price+technicals, web search, Telegram digest, 150+ assets
+  gather_company.py     # yfinance, SEC EDGAR, web search, earnings transcript, Telegram digest; parses PDF/DOCX/Excel/CSV uploads
+  gather_macro.py       # yfinance price+technicals, web search, Telegram digest, 150+ assets; parses PDF/DOCX/Excel/CSV uploads
   report_company.py     # Claude Opus + 10-part company framework + web search tool
   report_macro.py       # Claude Opus + 11-part macro framework + web search tool
   tg_group.py           # Sends report text + docx + PDF to Telegram groups via Telethon
@@ -145,6 +145,14 @@ export default {
     if (message.document) {
       const file_id   = message.document.file_id;
       const file_name = message.document.file_name || "upload";
+      const ext = (file_name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
+      const supported = [".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv"];
+      if (!supported.includes(ext)) {
+        await sendMessage(env.BOT_TOKEN, chat_id,
+          `Unsupported file type: ${ext || "(none)"}\nSupported: PDF, Word (.docx/.doc), Excel (.xlsx/.xls), CSV`
+        );
+        return new Response("ok");
+      }
       const caption   = (message.caption || "").replace(/\/ramp\s+\S+\s*/i, "").trim();
 
       const staged = await getStaged(env, chat_id);
