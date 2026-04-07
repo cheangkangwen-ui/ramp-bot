@@ -52,7 +52,7 @@ C:/Users/kangw/ramp-bot/
 DEPENDENCIES (installed in GitHub Actions):
 pip install anthropic yfinance pandas pdfplumber python-docx \
   duckduckgo-search requests beautifulsoup4 telethon python-dotenv
-+ sudo apt-get install -y libreoffice
++ sudo apt-get update && sudo apt-get install -y libreoffice
 
 SECRETS & ENVIRONMENT:
 
@@ -256,7 +256,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install LibreOffice
-        run: sudo apt-get install -y libreoffice
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice
 
       - name: Run ramp
         env:
