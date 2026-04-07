@@ -75,11 +75,34 @@ def detect_mode(asset: str) -> str:
     return "macro" if key in ASSET_MAP else "company"
 
 
+def validate_company_ticker(ticker: str) -> bool:
+    """Check if a ticker is a real company on yfinance."""
+    import yfinance as yf
+    try:
+        info = yf.Ticker(ticker).info
+        # Valid tickers have at least a market cap or a current price
+        return bool(info.get("marketCap") or info.get("currentPrice") or info.get("longName"))
+    except Exception:
+        return False
+
+
 def main():
     print(f"Asset: {ASSET}")
     staged_files, staged_captions = download_files()
     mode = detect_mode(ASSET)
     print(f"Mode: {mode}")
+
+    # Validate: if not a known macro asset, verify it's a real company ticker
+    if mode == "company" and not validate_company_ticker(ASSET):
+        send_message(
+            f"'{ASSET}' is not a recognized macro asset or valid company ticker.\n\n"
+            f"Examples:\n"
+            f"  Macro: GOLD, WTI, SPX, BTC, EURUSD, US10Y\n"
+            f"  Company: NVDA, AAPL, TSLA, MSFT\n\n"
+            f"Check the ticker and try again."
+        )
+        print(f"Invalid asset: {ASSET}")
+        sys.exit(0)
 
     if mode == "macro":
         from gather_macro import gather_all, resolve_asset
